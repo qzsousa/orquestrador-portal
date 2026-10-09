@@ -1,0 +1,17 @@
+{
+  "name": "orq",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Orquestrador multiagente para OpenCode: coordenacao de tarefas com isolamento por git worktree",
+  "bin": {
+    "orq": "./bin/orq.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test \"tests/**/*.test.mjs\"",
+    "orq": "node bin/orq.mjs"
+  }
+}

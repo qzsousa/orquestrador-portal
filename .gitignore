@@ -1,0 +1,19 @@
+# Estado de execucao (recuperavel, mas local e derivado)
+.state/
+
+# Worktrees das tarefas. Fica FORA do repo de produto de proposito: o worktree
+# e um clone de trabalho, nao fonte. Nunca versionar.
+worktrees/
+.state-backup/
+
+# Logs de execucao
+logs/
+
+# Credenciais. NUNCA versionar. Ver README (Trello).
+.env
+.env.*
+!.env.example
+
+node_modules/
+*.log
+.DS_Store
