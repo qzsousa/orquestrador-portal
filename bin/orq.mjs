@@ -166,17 +166,17 @@ async function cmdPlan(flags) {
     tasks = store.ativas()
   }
 
-  // 2. Dependências deduzidas.
-  const { tasks: comDeps, raciocinios } = planner.deduzirDependencias(tasks)
-  for (const t of comDeps) {
-    const atual = store.obter(t.id)
-    if (!atual) continue
-    const novasDeps = t.dependsOn.filter((d) => !(atual.dependsOn || []).includes(d))
-    if (novasDeps.length) store.atualizar(t.id, { dependsOn: [...atual.dependsOn, ...novasDeps] }, 'dependencias-deduzidas')
-  }
-  if (raciocinios.length) {
-    log(p(C.cyan, `\nDependências deduzidas:`))
-    for (const r of raciocinios) log(`  ${r.taskId} depende de ${r.dependeDe}  ${C.dim}(${r.motivo})${C.reset}`)
+  // 2. Sugestões de dependência — mostradas, NUNCA aplicadas sozinhas.
+  const { sugestoes } = planner.sugerirDependencias(store.ativas())
+  if (sugestoes.length) {
+    log(p(C.bold, '\nSugestões de dependência (não aplicadas):'))
+    log(p(C.dim, '  O orquestrador não confia na própria inferência: confirme com orq dep.'))
+    for (const s of sugestoes) {
+      const cor = s.confianca === 'media' ? C.yellow : C.dim
+      log(`  ${p(cor, '?')} ${s.taskId} pode depender de ${s.dependeDe}`)
+      log(`      ${C.dim}${s.motivo} (confiança ${s.confianca})${C.reset}`)
+      log(`      ${C.dim}aplicar: orq dep ${s.taskId} --add ${s.dependeDe}${C.reset}`)
+    }
   }
 
   // 3. Risco.
@@ -462,6 +462,63 @@ async function cmdIntegrate(flags, pos) {
   }
 }
 
+/* ------------------------------------------------------------------- dep */
+
+/**
+ * Corrige dependências na mão.
+ *
+ * O planner deduz dependência por palavra-chave e às vezes acerta mal. Quem
+ * decide a ordem final é a pessoa — por isso existe este comando, para não
+ * obrigar ninguém a editar o .state/tasks.json na mão.
+ */
+async function cmdDep(flags, pos) {
+  const cfg = await carregarConfig()
+  const store = storeDe(cfg)
+  const id = pos[0]
+  if (!id) {
+    erro('Uso: orq dep <ID> --add T-002 | --rm T-002')
+    process.exit(1)
+  }
+  const task = store.obter(id)
+  if (!task) {
+    erro(`Task ${id} não existe.`)
+    process.exit(1)
+  }
+
+  const alvo = flags.add || flags.rm
+  if (!alvo) {
+    log(`${p(C.bold, id)} depende de: ${(task.dependsOn || []).join(', ') || '(nada)'}`)
+    return
+  }
+
+  const atual = task.dependsOn || []
+  let novos
+  if (flags.add) {
+    if (atual.includes(alvo)) {
+      log(p(C.dim, `${id} já dependia de ${alvo}.`))
+      return
+    }
+    if (!store.obter(alvo)) {
+      erro(`Task ${alvo} não existe.`)
+      process.exit(1)
+    }
+    novos = [...atual, alvo]
+  } else {
+    if (!atual.includes(alvo)) {
+      log(p(C.dim, `${id} não dependia de ${alvo}.`))
+      return
+    }
+    novos = atual.filter((d) => d !== alvo)
+  }
+
+  store.atualizar(id, { dependsOn: novos }, 'dependencia-ajustada', { alvo, remover: Boolean(flags.rm) })
+  log(p(C.green, `✓ ${id} agora depende de: ${novos.join(', ') || '(nada)'}`))
+
+  reconciliarEstados(store)
+  const m = motivoBloqueio(task, store.ativas())
+  if (m) log(p(C.dim, `  ${m.mensagem}`))
+}
+
 /* ---------------------------------------------------------------- recover */
 
 async function cmdRecover() {
@@ -604,6 +661,7 @@ const COMANDOS = {
   status: cmdStatus,
   review: cmdReview,
   integrate: cmdIntegrate,
+  dep: cmdDep,
   recover: cmdRecover,
   clean: cmdClean,
   'trello-sync': cmdTrelloSync,
@@ -624,6 +682,7 @@ ${p(C.bold, 'Comandos:')}
   status             estado de tudo
   review             revisa aprovadas  (--todos --sem-aprovar)
   integrate          integra aprovadas  (--id X --aplicar)
+  dep <id>           ajusta dependencia  (--add T-002 | --rm T-002)
   recover            reidrata estado após reinício
   clean <id>         remove do estado  (--worktree também apaga branch)
   trello-sync        importa cards  (--board ID --listas "A,B")

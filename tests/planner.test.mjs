@@ -7,6 +7,7 @@ import assert from 'node:assert/strict'
 
 import {
   subtarefasDeChecklist,
+  sugerirDependencias,
   deduzirDependencias,
   detectarCiclo,
   ordenarTopologicamente,
@@ -44,51 +45,58 @@ describe('planner — decomposição por checklist', () => {
   })
 })
 
-describe('planner — dedução de dependências', () => {
-  test('frontend que consome depende do backend que muda o contrato', () => {
+describe('planner — dependências são SUGESTÕES, nunca aplicadas sozinhas', () => {
+  test('não escreve dependência no estado', () => {
     const tasks = [
-      t('T-001', {
-        titulo: 'Criar endpoint de avaliação de chamado no backend',
-        descricao: 'nova rota de API para avaliação',
-      }),
-      t('T-002', {
-        titulo: 'Exibir avaliação do chamado na tela do portal',
-        descricao: 'chamar no frontend e mostrar na view',
-      }),
+      t('T-001', { titulo: 'Criar rota de tutorial no backend', descricao: 'novo contrato de API para tutorial' }),
+      t('T-002', { titulo: 'Exibir tutorial na tela do portal', descricao: 'consumir tutorial no frontend' }),
     ]
-    const { tasks: comDeps, raciocinios } = deduzirDependencias(tasks)
-    const t2 = comDeps.find((x) => x.id === 'T-002')
-    assert.ok(t2.dependsOn.includes('T-001'), `T-002 deveria depender de T-001; deps=${t2.dependsOn}`)
-    assert.ok(raciocinios.some((r) => r.motivo.includes('contrato em comum')))
+    const antes = JSON.stringify(tasks.map((x) => x.dependsOn))
+    const { sugestoes } = sugerirDependencias(tasks)
+    assert.equal(JSON.stringify(tasks.map((x) => x.dependsOn)), antes, 'nenhuma task pode ter sido alterada')
+    assert.equal(sugestoes.length, 1, 'deve sugerir a ligação')
+    assert.equal(sugestoes[0].taskId, 'T-002')
+    assert.equal(sugestoes[0].dependeDe, 'T-001')
   })
 
-  test('não deduz dependência entre tarefas sem assunto em comum', () => {
-    const tasks = [
-      t('T-001', { titulo: 'Nova rota de API de inventário', descricao: 'contrato novo' }),
-      t('T-002', { titulo: 'Mostrar tutorial no frontend', descricao: 'exibir na tela' }),
-    ]
-    const { tasks: comDeps } = deduzirDependencias(tasks)
-    assert.deepEqual(comDeps.find((x) => x.id === 'T-002').dependsOn, [])
+  test('assunto específico dá confiança média; palavra do domínio dá baixa', () => {
+    const comTutorial = sugerirDependencias([
+      t('T-001', { titulo: 'Rota de tutorial no backend', descricao: 'novo contrato de API para tutorial' }),
+      t('T-002', { titulo: 'Tela de tutorial no portal', descricao: 'consumir tutorial no frontend' }),
+    ])
+    assert.equal(comTutorial.sugestoes[0].confianca, 'media')
+
+    const comChamado = sugerirDependencias([
+      t('T-001', { titulo: 'Backend: novo contrato de API para chamado', descricao: 'novo contrato e nova rota de API' }),
+      t('T-002', { titulo: 'Tela do portal que consome o chamado', descricao: 'o frontend exibe o chamado' }),
+    ])
+    assert.equal(comChamado.sugestoes.length, 1, 'deve sugerir, mas com confiança baixa')
+    assert.equal(comChamado.sugestoes[0].confianca, 'baixa', 'chamado e a palavra do dominio, nao prova nada')
   })
 
-  test('não cria dependência circular entre consumidor e produtor', () => {
+  test('função antiga não aplica mais nada', () => {
     const tasks = [
-      t('T-001', { titulo: 'API de chamado', descricao: 'contrato' }),
-      t('T-002', { titulo: 'tela de chamado', descricao: 'frontend chamado' }),
+      t('T-001', { titulo: 'Rota de tutorial no backend', descricao: 'novo contrato de API para tutorial' }),
+      t('T-002', { titulo: 'Tela de tutorial no portal', descricao: 'consumir tutorial no frontend' }),
     ]
-    const { tasks: comDeps } = deduzirDependencias(tasks)
-    const t1 = comDeps.find((x) => x.id === 'T-001')
-    const t2 = comDeps.find((x) => x.id === 'T-002')
-    assert.ok(!(t1.dependsOn.includes('T-002') && t2.dependsOn.includes('T-001')), 'ciclo criado')
+    const { tasks: saida } = deduzirDependencias(tasks)
+    assert.deepEqual(saida.find((x) => x.id === 'T-002').dependsOn, [])
   })
 
-  test('preserva dependência já declarada', () => {
+  test('não sugere quando o consumidor não é frontend', () => {
     const tasks = [
-      t('T-001', { titulo: 'x' }),
-      t('T-002', { titulo: 'y', dependsOn: ['T-001'] }),
+      t('T-001', { titulo: 'Criar rota de tutorial no backend', descricao: 'novo contrato de API para tutorial' }),
+      t('T-002', { titulo: 'Ajustar tempo de expiracao do token no backend', descricao: 'backend' }),
     ]
-    const { tasks: comDeps } = deduzirDependencias(tasks)
-    assert.deepEqual(comDeps.find((x) => x.id === 'T-002').dependsOn, ['T-001'])
+    assert.equal(sugerirDependencias(tasks).sugestoes.length, 0)
+  })
+
+  test('não sugere dependência já declarada nem invertida', () => {
+    const tasks = [
+      t('T-001', { titulo: 'Rota de tutorial no backend', descricao: 'novo contrato de API para tutorial' }),
+      t('T-002', { titulo: 'Tela de tutorial no portal', descricao: 'consumir tutorial no frontend', dependsOn: ['T-001'] }),
+    ]
+    assert.equal(sugerirDependencias(tasks).sugestoes.length, 0)
   })
 })
 

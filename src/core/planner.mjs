@@ -54,47 +54,81 @@ export function subtarefasDeChecklist(task, itens) {
  * errar na outra direção custa retrabalho. Por isso só marca dependência com
  * evidência textual forte, e sempre em silêncio.
  */
-export function deduzirDependencias(tasks) {
+/**
+ * Sugere dependências entre tasks. NÃO aplica nenhuma.
+ *
+ * Aqui estava a caixa-preta que mais deu trabalho: deduzir por palavra-chave e
+ * escrever a dependência no estado. O problema é que não existe heurística
+ * confiável para isso — "chamado" aparece em metade das tasks do sistema e
+ * "tutorial" aparece nas duas tasks que de fato se ligam. Nenhum limiar de
+ * frequência separa "palavra central do domínio" de "feature específica", e o
+ * custo do erro é alto: uma dependência inventada segura trabalho à toa.
+ *
+ * Por isso a dedução vira SUGESTÃO, e a pessoa decide com `orq dep`. Dado que
+ * você quer decidir prioridades e aprovações, e nãocoordenar máquina, essa é a
+ * divisão correta de trabalho: o orquestrador aponta a hipótese, não a factua.
+ *
+ * @returns {{tasks: object[], sugestoes: Array<{taskId, dependeDe, motivo, confianca}>}}
+ */
+export function sugerirDependencias(tasks) {
   const padroes = {
     'portal-consome': /frontend|portal|tela|view|cliente|consum|consumer|chamada no front|exibir na tela/i,
     'backend-muda-contrato': /contrato|endpoint|nova rota|schema|migra|modelo prisma|tabela|campo novo|api/i,
-    'chamados': /chamados|protocolo|sla|atendimento/i,
-    'sce': /sce|equipamento|emprestimo|empréstimo|catalogo|catálogo|auditoria/i,
   }
 
-  const novas = tasks.map((t) => ({ ...t, dependsOn: [...(t.dependsOn || [])] }))
-  const raciocinios = []
+  const porId = new Map(tasks.map((t) => [t.id, t]))
+  const assuntosPorTask = new Map(
+    tasks.map((t) => [t.id, assuntos([t.titulo, t.descricao, ...(t.criterios || [])].join(' '))]),
+  )
+  const sugestoes = []
 
-  for (const consumidor of novas) {
+  for (const consumidor of tasks) {
     const textoCons = [consumidor.titulo, consumidor.descricao, ...(consumidor.criterios || [])].join(' ')
     if (!padroes['portal-consome'].test(textoCons)) continue
+    const assuntosCons = assuntosPorTask.get(consumidor.id) || new Set()
 
-    for (const produtor of novas) {
+    for (const produtor of tasks) {
       if (produtor.id === consumidor.id) continue
-      if (consumidor.dependsOn.includes(produtor.id)) continue
+      if ((consumidor.dependsOn || []).includes(produtor.id)) continue
+      if (produtor.dependsOn?.includes(consumidor.id)) continue
+
       const textoProd = [produtor.titulo, produtor.descricao, ...(produtor.criterios || [])].join(' ')
-
-      // Só vale se o produtor realmente mexe num backend.
       if (!padroes['backend-muda-contrato'].test(textoProd)) continue
-      // Evitar dependência circular e ordem invertida por id.
-      if (produtor.dependsOn.includes(consumidor.id)) continue
 
-      // Evidência de que é o MESMO assunto, não só backend genérico.
-      const evidencia = shared(assuntos(textoCons), assuntos(textoProd))
+      const assuntosProd = assuntosPorTask.get(produtor.id) || new Set()
+      const evidencia = [...assuntosCons].filter((s) => assuntosProd.has(s))
       if (!evidencia.length) continue
 
-      consumidor.dependsOn.push(produtor.id)
-      raciocinios.push({
+      sugestoes.push({
         taskId: consumidor.id,
         dependeDe: produtor.id,
-        motivo: `contrato em comum: ${evidencia.join(', ')}`,
-        tipo: 'deduzida',
+        motivo: `mesmo assunto (${evidencia.join(', ')}): uma parece mudar o contrato, a outra consumir`,
+        // Assunto genérico que aparece em várias tasks é bem mais fraco como
+        // sinal do que um assunto que só existe naquele par.
+        confianca: evidencia.some((s) => ASSUNTOS_ESPECIFICOS.has(s)) ? 'media' : 'baixa',
       })
     }
   }
 
-  return { tasks: novas, raciocinios }
+  return { tasks, sugestoes }
 }
+
+/**
+ * Mantido por compatibilidade com quem chama a função antiga, mas agora
+ * devolve só tarefas sem tocar nas dependências. Deprecated de propósito:
+ * chamar isto e esperar que a dependência seja aplicada silenciosamente era
+ * exatamente o que produzia bloqueios sem explicação.
+ */
+export function deduzirDependencias(tasks) {
+  const { sugestoes } = sugerirDependencias(tasks)
+  return { tasks: tasks.map((t) => ({ ...t })), raciocinios: sugestoes }
+}
+
+/** Assuntos que, sozinhos, indicam bem mais chance de relação real. */
+const ASSUNTOS_ESPECIFICOS = new Set([
+  'tutorial', 'equipamento', 'emprestimo', 'empréstimo', 'auditoria', 'dvr',
+  'notificacao', 'notificação', 'inventario',
+])
 
 /** Palavras que identificam o "assunto" de uma tarefa, para casar com a outra. */
 function assuntos(texto) {
