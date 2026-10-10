@@ -310,10 +310,24 @@ async function cmdReview(flags, pos) {
       for (const a of r.avisos) log(`    ${p(C.yellow, '⚠')} ${a}`)
     }
 
-    const aprovado = r.aprovado && (crit.avaliados.length === 0 || crit.todosAtendidos)
+    // Critérios de aceitação são texto; gates são evidência. Reprovar por
+    // cobertura textual é reprovar por procurar palavra: aqui os três gates
+    // estavam verdes (a suíte inteira passando) e a task foi reprovada porque
+    // o critério "a suíte volta a npm test verde" não/share as palavras dos
+    // commits. Heurística de texto é aviso, nunca reprovação — a nota do
+    // próprio avaliarCriterios já dizia isso, e o código não cumpria.
+    const aprovado = r.aprovado
+    const criteriosEmAlerta = crit.avaliados.length > 0 && !crit.todosAtendidos
+
     log('')
     if (aprovado) {
-      log(p(C.green, `  ✓ APROVADA — ${tid} vai para aguardando-integracao`))
+      if (criteriosEmAlerta) {
+        log(p(C.yellow, `  ⚠ APROVADA com ressalva — ${tid}`))
+        log(p(C.dim, '    Evidência mecânica (gates) passou. Os critérios acima não têm cobertura textual.'))
+        log(p(C.dim, '    Confira na revisão se eles são de fato satisfeitos.'))
+      } else {
+        log(p(C.green, `  ✓ APROVADA — ${tid} vai para aguardando-integracao`))
+      }
       if (!flags['sem-aprovar']) {
         store.mudarEstado(tid, 'aguardando-integracao', { revisao: { ...r, criterios: crit, aprovadoEm: new Date().toISOString() } }, 'Revisão aprovada')
       }
