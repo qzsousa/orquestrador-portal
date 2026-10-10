@@ -28,10 +28,14 @@ import { join } from 'node:path'
 const PORTA_PADRAO = 4653
 
 export class OpencodeError extends Error {
-  constructor(mensagem, { status, body } = {}) {
+  constructor(mensagem, { status, body, causa } = {}) {
     super(mensagem)
     this.status = status
     this.body = body
+    // Código real por trás da queda (ECONNRESET, ECONNREFUSED, ...). Sem ele o
+    // diagnóstico para em "algo quebrou" e não dá para distinguir rede de
+    // processo morto.
+    this.causa = causa
   }
 }
 
@@ -68,10 +72,21 @@ export class OpencodeClient {
       if (ct.includes('application/json')) return res.json()
       return await res.text()
     } catch (err) {
+      if (err instanceof OpencodeError) throw err
       if (err.name === 'AbortError') {
         throw new OpencodeError(`${modo} ${caminho} excedeu ${timeoutMs}ms`, { status: 'timeout' })
       }
-      throw err
+      // O undici esconde o motivo real em .cause e ainda devolve um
+      // "TypeError: fetch failed" genérico. Sem desembrulhar, esse texto
+      // chegava ao estado da task como se fosse culpa do agente — e não era:
+      // era o orquestrador que tinha caído. O agente continuava rodando.
+      const causa = err?.cause
+      const codigo = causa?.code || err?.code || null
+      throw new OpencodeError(
+        `conexão com o servidor OpenCode caiu em ${modo} ${caminho}` +
+          (codigo ? ` (${codigo})` : ''),
+        { status: 'transporte', causa: codigo },
+      )
     } finally {
       clearTimeout(timer)
     }
@@ -130,6 +145,35 @@ export class OpencodeClient {
 
   sessao(sessionID) {
     return this.request('GET', `/session/${sessionID}`, { timeoutMs: 15000 })
+  }
+
+  /**
+   * Histórico de mensagens da sessão.
+   *
+   * É o que torna a recuperação possível: a sessão vive dentro do `opencode
+   * serve`, que é solto. Quando o `orq run` morre no meio, a sessão continua
+   * existindo no servidor com tudo o que o agente produziu — inclusive o
+   * resumo final. Sem este método, esse texto ficava inalcançável.
+   */
+  mensagens(sessionID, directory) {
+    return this.request('GET', `/session/${sessionID}/message`, {
+      query: { directory },
+      timeoutMs: 30000,
+    })
+  }
+
+  /** Último texto que o agente escreveu, ou '' se não houver. */
+  async ultimoTextoDoAgente(sessionID, directory) {
+    const msgs = await this.mensagens(sessionID, directory)
+    const lista = Array.isArray(msgs) ? msgs : []
+    for (let i = lista.length - 1; i >= 0; i--) {
+      if (lista[i]?.info?.role !== 'assistant') continue
+      const textos = (lista[i].parts || [])
+        .filter((x) => x.type === 'text' && x.text?.trim())
+        .map((x) => x.text)
+      if (textos.length) return textos.join('\n\n')
+    }
+    return ''
   }
 
   responderPermissao(sessionID, requestID, resposta) {
@@ -295,8 +339,21 @@ export function extrairTexto(resposta) {
 
 /** Parts que registraram erro — sinal de task que vai falhar. */
 export function extrairErros(resposta) {
-  const parts = resposta?.parts || []
   const erros = []
+
+  // Falha no nível da mensagem, não de uma part. Ocorre quando o agente nem
+  // chegou a produzir ferramenta nenhuma: provedor devolvendo HTTP 400,
+  // autenticação, modelo inexistente. Sem olhar aqui, `extrairErros` devolvia
+  // lista vazia e o orquestrador concluía "a task não alterou nada" — que é
+  // falso. O agente não falhou em codar; ele nunca chegou a rodar.
+  const erroMsg = resposta?.info?.error
+  if (erroMsg) {
+    const d = erroMsg.data || erroMsg
+    const status = d.statusCode ? ` (HTTP ${d.statusCode})` : ''
+    erros.push(`agente: ${erroMsg.name || 'erro'}${status}: ${d.message || d}`)
+  }
+
+  const parts = resposta?.parts || []
   for (const p of parts) {
     if (p?.state?.status === 'error' && p.state.error) {
       erros.push(String(p.state.error?.data?.message || p.state.error?.name || p.state.error))

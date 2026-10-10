@@ -75,9 +75,10 @@ export default {
       rotulo: 'Backend de chamados (Node + Express + Prisma)',
       repo: 'C:/Users/Pablo/Desktop/chamados',
       branch: 'main',
-      // Sem gate: a verificação deste backend ainda não foi declarada. Enquanto
-      // isso, a revisão dele se apoia em commits e critérios de aceitação.
-      gates: [],
+      gates: [
+        { nome: 'typecheck', args: ['run', 'typecheck'], obrigatorio: true, cwd: 'backend' },
+        { nome: 'test', args: ['test'], obrigatorio: true, cwd: 'backend' },
+      ],
     },
 
     sce: {

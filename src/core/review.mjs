@@ -131,6 +131,36 @@ export function rodarGate({ gate, cwd, timeoutMs = 15 * 60 * 1000, env = {} }) {
 }
 
 /**
+ * Arquivos citados nas linhas de FALHA da saída do gate.
+ *
+ * O formato da saída é do runner de testes, e ele varia: vitest, um script
+ * próprio que só imprime "FALTA: x.ts", npm, make. Casar o formato de um
+ * runner deixa o resto cego — foi o que quebrou o E2E. Então a regra é a
+ * inversa: descarta as linhas que dizem que deu certo e considera todas as
+ * outras.
+ *
+ * Descartar as linhas de sucesso é o ponto. O vitest lista no resumo também
+ * os arquivos que passaram (` ✓ x.test.ts`), e a versão anterior da heurística
+ * varria a saída inteira: viu o nome de um arquivo que PASSOU e acusou a
+ * task de ter quebrado o gate. Foi assim que a T-003 foi reprovada.
+ */
+function arquivosQueFalharam(stdout, stderr) {
+  const texto = `${stdout || ''}\n${stderr || ''}`
+  const arquivos = new Set()
+  for (const linha of texto.split(/\r?\n/)) {
+    const limpo = linha.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').trim()
+    if (!limpo) continue
+    // Linha de sucesso: o arquivo citado nela passou.
+    if (/^[✓✔√]/.test(limpo)) continue
+    if (/\b(passed|passing)\b/i.test(limpo)) continue
+    for (const m of limpo.matchAll(/[\w.\-@/\\]+\.(?:ts|tsx|vue|js|mjs|json|md|css)/g)) {
+      arquivos.add(m[0])
+    }
+  }
+  return arquivos
+}
+
+/**
  * Atribui (ou não) a falha do gate a esta task.
  *
  * Um gate de repositório (build, suíte completa) mede o TODO o repositório,
@@ -142,17 +172,21 @@ export function rodarGate({ gate, cwd, timeoutMs = 15 * 60 * 1000, env = {} }) {
  * A regra: se a falha aponta para arquivo que ESTA task alterou, é culpa dela
  * (bloqueante). Se não aponta para nenhum arquivo dela, é sinalizado como
  * aviso e a validação real acontece na integração, sobre o conjunto completo.
+ *
+ * Limite conhecido, e vale registrar: a atribuição é por nome de arquivo. Uma
+ * task que quebra um teste cujo arquivo não tem o mesmo nome do arquivo que
+ * alterou (muda `usuarios.ts` e quebra um `usuarios.test.ts` de outro módulo)
+ * passa como aviso. Fechar essa brecha de vez exige comparar a suíte na base
+ * contra a suíte na head.
  */
-function culpaDaTask(gate, arquivosDaTask) {
-  const texto = `${gate.stdout || ''}\n${gate.stderr || ''}`
-  const citados = texto.match(/[\w.\-@/\\]+\.(?:ts|tsx|vue|js|mjs|json|md|css)/g) || []
+export function culpaDaTask(gate, arquivosDaTask) {
+  const falharam = arquivosQueFalharam(gate.stdout, gate.stderr)
   const meus = new Set((arquivosDaTask || []).map((f) => f.toLowerCase().replace(/\\/g, '/')))
   const meusBase = new Set([...meus].map((f) => f.split('/').pop()))
-  const tocaAlgoMeu = citados.some((c) => {
-    const cn = c.toLowerCase().replace(/\\/g, '/')
-    return meus.has(cn) || meusBase.has(cn.split('/').pop())
+  return [...falharam].some((f) => {
+    const fn = f.toLowerCase().replace(/\\/g, '/')
+    return meus.has(fn) || meusBase.has(fn.split('/').pop())
   })
-  return tocaAlgoMeu
 }
 
 /**

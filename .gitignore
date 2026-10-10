@@ -6,6 +6,11 @@
 worktrees/
 .state-backup/
 
+# Worktrees que o E2E cria dentro deste proprio repo (o E2E roda com
+# worktreesDir apontando para cá). São repos git aninhados: se entrarem no
+# índice, o git passa a registrá-los como gitlink e o commit fica inservível.
+orq-worktrees/
+
 # Logs de execucao
 logs/
 

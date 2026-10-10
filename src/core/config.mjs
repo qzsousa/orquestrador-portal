@@ -49,8 +49,12 @@ export const COMPONENTES_PADRAO = {
     rotulo: 'Backend de chamados (Node + Express + Prisma)',
     repo: 'C:/Users/Pablo/Desktop/chamados',
     branch: 'main',
-    gates: [],
-    notas: 'Sem gate automático configurado. A verificação é do próprio backend.',
+    // Suite real (vitest) e typecheck. Sem estes, a task do backend seria
+    // aceita sem nenhuma verificação automatizada.
+    gates: [
+      { nome: 'typecheck', args: ['run', 'typecheck'], obrigatorio: true, cwd: 'backend' },
+      { nome: 'test', args: ['test'], obrigatorio: true, cwd: 'backend' },
+    ],
   },
   sce: {
     rotulo: 'Backend SCE (Node + Express + Supabase)',
@@ -91,6 +95,13 @@ export const PADRAO = {
     worker: 'orq-worker',
     reviewer: 'orq-reviewer',
     integrator: 'orq-integrator',
+    /**
+     * Modelo do worker, no formato "provider/modelo" (ex.: "opencode/gemini-3.8-flash").
+     * Vazio = herda o padrão global da máquina. Fixar aqui é o que permite
+     * trocar de modelo quando um provedor começa a rejeitar uma requisição,
+     * sem mexer no código.
+     */
+    workerModel: '',
   },
   /** Timeout de uma task (ms). Tarefas grandes existem; 45min é o padrão. */
   taskTimeoutMs: 45 * 60 * 1000,

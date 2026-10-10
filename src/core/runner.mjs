@@ -167,6 +167,12 @@ export async function executarTask({ cfg, store, task, client, log = () => {} })
     const sessao = await client.criarSessao({
       directory: worktree,
       agent: cfg.agentes.worker,
+      // Sem modelo explícito a sessão herda o padrão global da máquina. Isso
+      // couples o orquestrador à configuração de quem está rodando: quando o
+      // modelo padrão é rejeitado pelo provedor, toda task morre pelo mesmo
+      // motivo e o relatório não diz qual. Fixar aqui deixa a falha visível e
+      // troca de modelo é uma linha de config, não de código.
+      model: cfg.agentes.workerModel || undefined,
       title: `orq ${task.id}: ${task.titulo}`,
       metadata: { orqTaskId: task.id, componente: componentePrincipal },
     })
@@ -259,11 +265,25 @@ export async function executarTask({ cfg, store, task, client, log = () => {} })
     try {
       const atual = store.obter(task.id)
       if (atual && atual.estado === 'em-andamento') {
+        // Queda de transporte NÃO é falha do agente. O `opencode serve` é
+        // solto: ele continua executando o agente mesmo depois de o
+        // orquestrador morrer, e o agente pode commitar normalmente. Marcar
+        // como bloqueada com o texto cru do erro levava a pessoa a descartar
+        // trabalho que já estava pronto — que foi exatamente o que aconteceu
+        // com a T-003. Aqui a task fica bloqueada mas com o motivo certo e a
+        // instrução de recuperação.
+        const caiu = err.status === 'transporte' || err.status === 'timeout'
+        const motivo = caiu
+          ? `${err.message}. O orquestrador perdeu a conexão, mas o servidor do OpenCode ` +
+            `segue no ar e o agente pode ter terminado e commitado. ` +
+            `Rode "orq adopt ${task.id}" para recolher o que foi feito, ` +
+            `ou "orq run" para refazer do zero.`
+          : err.message
         const tentativas = atual.tentativa || 1
-        if (tentativas >= (cfg.maxTentativas || 2)) {
-          store.mudarEstado(task.id, 'falhou', { erros: [...(atual.erros || []), err.message] }, err.message)
+        if (!caiu && tentativas >= (cfg.maxTentativas || 2)) {
+          store.mudarEstado(task.id, 'falhou', { erros: [...(atual.erros || []), motivo] }, motivo)
         } else {
-          store.mudarEstado(task.id, 'bloqueada', { erros: [...(atual.erros || []), err.message] }, err.message)
+          store.mudarEstado(task.id, 'bloqueada', { erros: [...(atual.erros || []), motivo] }, motivo)
         }
       }
     } catch {
