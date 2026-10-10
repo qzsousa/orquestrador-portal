@@ -16,23 +16,48 @@ import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import * as git from './git.mjs'
 import { ordemDeIntegracao, conflitosEntreBranches } from './scheduler.mjs'
-import { prepararAmbiente, limparAmbiente, rodarGate } from './review.mjs'
+import { prepararAmbiente, limparAmbiente, rodarGate, subdiretoriosDeGate } from './review.mjs'
 
 /**
  * Prepara o worktree de integração. Base = branch principal no momento da
  * integração (não o base da task): é contra a main que a mudança precisa provar
  * que funciona.
  */
-export function prepararIntegracao({ cfg, repo, nome = 'integracao' }) {
+export function prepararIntegracao({ cfg, repo, nome = 'integracao', gates = [] }) {
   const dir = join(cfg.worktreesDir, '__integracao__', nome)
   const branch = `${cfg.integrationBranchPrefix}/${nome}`
 
   if (existsSync(dir)) {
     git.removerWorktree(repo, dir, { forcar: true })
   }
+
+  // Registro de worktree cujo diretório já não existe (interrupção, limpeza
+  // manual, queda) continua no git e aparece como "prunable". Enquanto ele
+  // estiver lá, o git recusa `branch -D` dizendo que a branch está em uso —
+  // e a integração seguinte falha com "Branch já existe" sem que exista
+  // worktree nenhum. prune remove só as entradas cujo diretório sumiu.
+  try {
+    git.run(['worktree', 'prune'], { cwd: repo })
+  } catch {}
+
+  // A branch de integração pertence ao orq e é reconstruída do zero a cada
+  // rodada, a partir da principal. Deixá-la para trás fazia TODA integração
+  // seguinte falhar com "Branch já existe" — inclusive a recuperação de uma
+  // integração que falhou por outro motivo, que é justamente quando se precisa
+  // dela. Só some com a branch se nenhum worktree estiver segurando.
+  if (git.branchExists(branch, repo)) {
+    const segurando = git.worktreeList(repo).some((w) => w.branch === branch)
+    if (!segurando) {
+      git.run(['branch', '-D', branch], { cwd: repo, allowDestructive: true })
+    }
+  }
   const mainBranch = git.branchAtual(repo)
   const wt = git.criarWorktree({ repo, dir, branch, baseRef: mainBranch })
-  prepararAmbiente(dir, repo)
+  // Os gates rodam nos mesmos cwds que rodam na task. Sem preparar o
+  // node_modules desses subdiretórios, o gate falha com "tsc não é
+  // reconhecido" — e isso parece falha do código integrado quando na verdade
+  // é o worktree sem dependência.
+  prepararAmbiente(dir, repo, subdiretoriosDeGate(gates))
   return { ...wt, branchPrincipal: mainBranch }
 }
 
@@ -73,8 +98,11 @@ export function integrar({ cfg, tasks, repo, nome = 'integracao' }) {
   relatorio.ordem = ordenadas.map((t) => t.id)
 
   let integracao
+  // Os gates são conhecidos antes do worktree existir: o ambiente precisa ser
+  // preparado nos mesmos subdiretórios onde os gates vão rodar.
+  const gates = gatesDasTasks(cfg, ordenadas)
   try {
-    integracao = prepararIntegracao({ cfg, repo, nome })
+    integracao = prepararIntegracao({ cfg, repo, nome, gates })
     relatorio.branchIntegracao = integracao.branch
     relatorio.base = integracao.baseSha
   } catch (err) {
@@ -121,21 +149,65 @@ export function integrar({ cfg, tasks, repo, nome = 'integracao' }) {
   }
 
   // Fase 2 — valida o conjunto integrado, uma vez, sobre a árvore final.
-  const gates = gatesDasTasks(cfg, ordenadas)
   let gatesOk = true
-  for (const g of gates) {
+
+  // Gates de preparação rodam ANTES dos que verificam. O caso é o Prisma: o
+  // client gerado fica dentro de node_modules, que é compartilhado por junction
+  // com o repo base. Se o gate verificar antes de gerar, ele checa o código
+  // novo contra o client do schema antigo e acusa erro de tipo que não existe
+  // — falha de ambiente vestida de falha de código. O próprio projeto já
+  // resolve isso no Dockerfile e no render.yaml ("npx prisma generate && npm
+  // run build"); o gate só estava fazendo menos que o build de produção.
+  const preparacoes = gates.filter((g) => g.preparar)
+  const verificacoes = gates.filter((g) => !g.preparar)
+
+  for (const g of preparacoes) {
+    const cwd = g.cwd ? join(integracao.worktree, g.cwd) : integracao.worktree
+    if (!existsSync(join(cwd, 'package.json'))) {
+      relatorio.avisos.push(`Preparação "${g.nome}" pulada: ${join(g.cwd || '.', 'package.json')} não existe`)
+      continue
+    }
+    const res = rodarGate({ gate: g, cwd })
+    relatorio.gates.push({ ...res, taskId: 'integracao', fase: 'preparar' })
+    if (!res.ok) {
+      gatesOk = false
+      relatorio.bloqueios.push(
+        `Preparação "${g.nome}" falhou (exit ${res.exitCode}). ` +
+          `Últimas linhas: ${(res.stderr || res.stdout).trim().split('\n').slice(-4).join(' | ')}`,
+      )
+    }
+  }
+
+  for (const g of verificacoes) {
     const cwd = g.cwd ? join(integracao.worktree, g.cwd) : integracao.worktree
     if (!existsSync(join(cwd, 'package.json'))) {
       relatorio.avisos.push(`Gate "${g.nome}" pulado: ${join(g.cwd || '.', 'package.json')} não existe`)
       continue
     }
     const res = rodarGate({ gate: g, cwd })
-    relatorio.gates.push({ ...res, taskId: 'integracao' })
+    relatorio.gates.push({ ...res, taskId: 'integracao', fase: 'verificar' })
     if (!res.ok) {
       gatesOk = false
       relatorio.bloqueios.push(
         `Gate "${g.nome}" falhou no conjunto integrado (exit ${res.exitCode}). ` +
           `Últimas linhas: ${(res.stderr || res.stdout).trim().split('\n').slice(-4).join(' | ')}`,
+      )
+    }
+  }
+
+  // O client gerado é compartilhado com o repo base (junction). Gerar no
+  // worktree de integração deixa o repo base com um client de outro schema.
+  // Reexecutar a preparação no repo base devolve ele ao estado coerente com a
+  // main — que é o que o próximo typecheck dele espera.
+  for (const g of preparacoes) {
+    const cwdBase = g.cwd ? join(repo, g.cwd) : repo
+    if (!existsSync(join(cwdBase, 'package.json'))) continue
+    const res = rodarGate({ gate: g, cwd: cwdBase })
+    relatorio.gates.push({ ...res, taskId: 'repo-base', fase: 'restaurar-base' })
+    if (!res.ok) {
+      relatorio.avisos.push(
+        `Não foi possível restaurar o ambiente do repo base com "${g.nome}" ` +
+          `(exit ${res.exitCode}). Rode o comando manualmente antes de usar a main.`,
       )
     }
   }
@@ -208,9 +280,9 @@ export function aplicarNaPrincipal({ repo, baseSha, branchPrincipal }) {
 }
 
 /** Limpa worktrees de integração que não estão mais em uso. */
-export function limparIntegracao({ repo, dir }) {
+export function limparIntegracao({ repo, dir, gates = [] }) {
   if (!existsSync(dir)) return false
+  limparAmbiente(dir, subdiretoriosDeGate(gates))
   git.removerWorktree(repo, dir, { forcar: true })
-  limparAmbiente(dir)
   return true
 }

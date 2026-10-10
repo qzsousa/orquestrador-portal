@@ -147,6 +147,96 @@ describe('agente que nem começou a rodar', () => {
   })
 })
 
+/* ------------------------------------------ execução longa sem POST travado */
+
+describe('esperarAgente — o agente pode levar mais de 5 minutos', () => {
+  const ok = (corpo) => ({
+    ok: true,
+    status: 200,
+    headers: { get: () => 'application/json' },
+    json: async () => corpo,
+  })
+
+  const assistant = (finish, erro) => ({ info: { role: 'assistant', finish, error: erro }, parts: [] })
+
+  test('devolve assim que a última mensagem ganha finish', async () => {
+    let n = 0
+    const client = new OpencodeClient({
+      fetchImpl: async () => {
+        n++
+        // em andamento, em andamento, terminou
+        return ok(n < 3 ? [assistant('')] : [assistant('stop')])
+      },
+    })
+    const r = await client.esperarAgente({ sessionID: 'ses_x', intervaloMs: 1 })
+    assert.equal(r.info.finish, 'stop')
+    assert.equal(n, 3)
+  })
+
+  test('devolve imediatamente quando o agente reporta erro', async () => {
+    const client = new OpencodeClient({
+      fetchImpl: async () => ok([assistant('', { name: 'APIError', data: { message: '400', statusCode: 400 } })]),
+    })
+    const r = await client.esperarAgente({ sessionID: 'ses_x', intervaloMs: 1 })
+    assert.equal(r.info.error.name, 'APIError')
+    assert.match(extrairErros(r)[0], /HTTP 400/)
+  })
+
+  test('pico de rede no meio da espera não joga o trabalho fora', async () => {
+    let n = 0
+    const client = new OpencodeClient({
+      fetchImpl: async () => {
+        n++
+        if (n <= 3) throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNRESET' } })
+        return ok([assistant('stop')])
+      },
+    })
+    const r = await client.esperarAgente({ sessionID: 'ses_x', intervaloMs: 1, maxFalhasConsecutivas: 5 })
+    assert.equal(r.info.finish, 'stop')
+    assert.equal(n, 4)
+  })
+
+  test('desiste só depois de várias falhas seguidas', async () => {
+    const client = new OpencodeClient({
+      fetchImpl: async () => {
+        throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNRESET' } })
+      },
+    })
+    await assert.rejects(
+      () => client.esperarAgente({ sessionID: 'ses_x', intervaloMs: 1, maxFalhasConsecutivas: 3 }),
+      /ECONNRESET/,
+    )
+  })
+
+  test('estoura o prazo e diz que o agente não terminou', async () => {
+    const client = new OpencodeClient({ fetchImpl: async () => ok([assistant('')]) })
+    await assert.rejects(
+      () => client.esperarAgente({ sessionID: 'ses_x', intervaloMs: 5, timeoutMs: 60 }),
+      (err) => {
+        assert.equal(err.status, 'timeout')
+        return true
+      },
+    )
+  })
+
+  test('enviarPrompt dispara assíncrono em vez de travar num POST longo', async () => {
+    const chamadas = []
+    const client = new OpencodeClient({
+      fetchImpl: async (url, opts) => {
+        chamadas.push(`${opts.method} ${new URL(url).pathname}`)
+        if (opts.method === 'POST') return { ok: true, status: 204, headers: { get: () => '' }, text: async () => '' }
+        return ok([assistant('stop')])
+      },
+    })
+    await client.enviarPrompt({ sessionID: 'ses_x', texto: 'oi', intervaloMs: 1 })
+    assert.ok(chamadas.some((c) => c.includes('prompt_async')), `chamadas: ${chamadas.join(', ')}`)
+    // O GET de /message é o polling e é esperado. O que não pode existir é o
+    // POST em /message, que é o que trava e estoura o headers timeout.
+    const postBloqueante = chamadas.filter((c) => c.startsWith('POST') && /\/message$/.test(c))
+    assert.deepEqual(postBloqueante, [], `POST bloqueante em /message: ${postBloqueante.join(', ')}`)
+  })
+})
+
 /* ------------------------------------------- atribuição de falha de gate */
 
 describe('gate — a falha tem de ser da task, não só cite o nome dela', () => {

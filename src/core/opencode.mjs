@@ -27,6 +27,8 @@ import { join } from 'node:path'
 
 const PORTA_PADRAO = 4653
 
+const dormir = (ms) => new Promise((r) => setTimeout(r, ms))
+
 export class OpencodeError extends Error {
   constructor(mensagem, { status, body, causa } = {}) {
     super(mensagem)
@@ -113,16 +115,60 @@ export class OpencodeClient {
   }
 
   /**
-   * Envia prompt e ESPERA o agente terminar. Síncrono de propósito: o
-   * orquestrador precisa saber que a task acabou para poder revisar, e um
-   * `prompt_async` + polling casper seria mais código sem ganho de confiabilidade.
+   * Envia o briefing e ESPERA o agente terminar.
+   *
+   * Não é um POST bloqueante, e essa distinção é o ponto. Um POST em
+   * `/message` que espera o agente inteiro morre por volta dos 5 minutos: o
+   * undici aborta por headers timeout (300s) muito antes de um agente de
+   * verdade terminar, e o orquestrador registra "conexão caiu" — enquanto o
+   * agente segue rodando no servidor e commita normalmente. Foi esse o defeito
+   * que fez a T-003 parecer task falha do agente quando estava pronta.
+   *
+   * O caminho da API para trabalho longo é `prompt_async`, que devolve 204 na
+   * hora. Depois é só esperar por polling, com requisições curtas que nunca
+   * batem em timeout de headers.
    */
-  async enviarPrompt({ sessionID, texto, agent, timeoutMs = 1800000 }) {
-    const resposta = await this.request('POST', `/session/${sessionID}/message`, {
+  async enviarPrompt({ sessionID, texto, agent, timeoutMs = 1800000, directory, intervaloMs = 3000 }) {
+    await this.request('POST', `/session/${sessionID}/prompt_async`, {
+      query: { directory },
       body: { parts: [{ type: 'text', text: texto }], agent },
-      timeoutMs,
+      timeoutMs: 60000,
     })
-    return resposta
+    return this.esperarAgente({ sessionID, directory, timeoutMs, intervaloMs })
+  }
+
+  /**
+   * Aguarda o agente terminar, por polling das mensagens.
+   *
+   * Terminado = a última mensagem de assistant ganhou um `finish` (ou um
+   * `error`). Enquanto ela está em andamento, `finish` vem vazio.
+   *
+   * Um erro de rede no meio do polling não aborta a espera: um agente pode
+   * levar 40 minutos e não é razoável perder o trabalho por um pico de 2
+   * segundos. Só desiste depois de várias falhas seguidas.
+   */
+  async esperarAgente({ sessionID, directory, timeoutMs = 1800000, intervaloMs = 3000, maxFalhasConsecutivas = 5 }) {
+    const limite = Date.now() + timeoutMs
+    let falhasConsecutivas = 0
+
+    while (Date.now() < limite) {
+      try {
+        const msgs = await this.mensagens(sessionID, directory)
+        const lista = Array.isArray(msgs) ? msgs : []
+        falhasConsecutivas = 0
+        for (let i = lista.length - 1; i >= 0; i--) {
+          const info = lista[i]?.info
+          if (info?.role !== 'assistant') continue
+          if (info.error || info.finish) return lista[i]
+          break
+        }
+      } catch (err) {
+        falhasConsecutivas++
+        if (falhasConsecutivas >= maxFalhasConsecutivas) throw err
+      }
+      await dormir(intervaloMs)
+    }
+    throw new OpencodeError(`agente não terminou em ${Math.round(timeoutMs / 1000)}s`, { status: 'timeout' })
   }
 
   abortar(sessionID) {

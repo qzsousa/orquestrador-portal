@@ -49,9 +49,14 @@ export const COMPONENTES_PADRAO = {
     rotulo: 'Backend de chamados (Node + Express + Prisma)',
     repo: 'C:/Users/Pablo/Desktop/chamados',
     branch: 'main',
-    // Suite real (vitest) e typecheck. Sem estes, a task do backend seria
-    // aceita sem nenhuma verificação automatizada.
+    // `prisma:generate` primeiro, e `preparar: true`, porque o client gerado do
+    // Prisma mora dentro de node_modules — que o orquestrador compartilha com o
+    // repo base por junction. Sem regenerar, o typecheck compara código novo
+    // contra tipos de schema antigo e acusa erro que não existe. O projeto já
+    // faz essa etapa no Dockerfile e no render.yaml; o gate só precisa
+    // espelhar o build de produção.
     gates: [
+      { nome: 'prisma:generate', args: ['run', 'prisma:generate'], obrigatorio: true, cwd: 'backend', preparar: true },
       { nome: 'typecheck', args: ['run', 'typecheck'], obrigatorio: true, cwd: 'backend' },
       { nome: 'test', args: ['test'], obrigatorio: true, cwd: 'backend' },
     ],

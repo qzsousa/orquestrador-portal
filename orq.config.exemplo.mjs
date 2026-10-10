@@ -76,6 +76,9 @@ export default {
       repo: 'C:/Users/Pablo/Desktop/chamados',
       branch: 'main',
       gates: [
+        // `preparar: true` roda antes dos gates que verificam. Use para
+        // ferramenta que gera artefato a partir do codigo (Prisma, codegen).
+        { nome: 'prisma:generate', args: ['run', 'prisma:generate'], obrigatorio: true, cwd: 'backend', preparar: true },
         { nome: 'typecheck', args: ['run', 'typecheck'], obrigatorio: true, cwd: 'backend' },
         { nome: 'test', args: ['test'], obrigatorio: true, cwd: 'backend' },
       ],

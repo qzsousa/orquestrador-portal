@@ -17,7 +17,7 @@ import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import * as git from './git.mjs'
 import { extrairTexto, extrairErros, extrairFerramentas } from './opencode.mjs'
-import { prepararAmbiente } from './review.mjs'
+import { prepararAmbiente, subdiretoriosDeGate } from './review.mjs'
 import { repoDoComponente, componentesDaTask, docsRelevantes } from './config.mjs'
 
 /**
@@ -154,7 +154,7 @@ export async function executarTask({ cfg, store, task, client, log = () => {} })
     const wt = git.criarWorktree({ repo, dir: worktree, branch, baseRef })
     registro.etapas.push({ etapa: 'worktree', ok: true, worktree, branch, baseSha: wt.baseSha })
 
-    const env = prepararAmbiente(worktree, repo)
+    const env = prepararAmbiente(worktree, repo, subdiretoriosDeGate(cfg.componentes[componentePrincipal]?.gates || []))
     registro.etapas.push({ etapa: 'ambiente', ok: true, ...env })
 
     store.atualizar(task.id, { worktree, branch, baseSha: wt.baseSha, baseRef }, 'worktree-criado', {
@@ -172,7 +172,7 @@ export async function executarTask({ cfg, store, task, client, log = () => {} })
       // modelo padrão é rejeitado pelo provedor, toda task morre pelo mesmo
       // motivo e o relatório não diz qual. Fixar aqui deixa a falha visível e
       // troca de modelo é uma linha de config, não de código.
-      model: cfg.agentes.workerModel || undefined,
+      model: modeloDe(cfg.agentes.workerModel),
       title: `orq ${task.id}: ${task.titulo}`,
       metadata: { orqTaskId: task.id, componente: componentePrincipal },
     })
@@ -197,6 +197,7 @@ export async function executarTask({ cfg, store, task, client, log = () => {} })
       sessionID: sessao.id,
       texto: briefing,
       agent: cfg.agentes.worker,
+      directory: worktree,
       timeoutMs: cfg.taskTimeoutMs,
     })
 
@@ -291,6 +292,20 @@ export async function executarTask({ cfg, store, task, client, log = () => {} })
     }
     return registro
   }
+}
+
+/**
+ * "provider/modelo" -> { providerID, id }.
+ *
+ * O POST /session exige esse objeto e rejeita string solta com 400 — o schema
+ * é `additionalProperties: false` com `id` e `providerID` obrigatórios.
+ */
+function modeloDe(valor) {
+  if (!valor) return undefined
+  if (typeof valor === 'object') return valor
+  const i = String(valor).indexOf('/')
+  if (i < 1) return undefined
+  return { providerID: String(valor).slice(0, i), id: String(valor).slice(i + 1) }
 }
 
 /** Pega a primeira seção markdown com o nome pedido (para o resumo no state). */

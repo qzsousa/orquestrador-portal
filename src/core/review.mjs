@@ -12,7 +12,7 @@
  */
 
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, symlinkSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, rmSync, symlinkSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import * as git from './git.mjs'
 
@@ -42,35 +42,104 @@ function alvoNpm() {
 }
 
 /**
+ * Todos os `node_modules` de um repo, em caminho relativo à raiz.
+ *
+ * Um repo não tem um `node_modules`, tem vários: a raiz, `backend/`,
+ * `frontend/`, `shared/types/`… O orquestrador espelha o diretório inteiro via
+ * junction, então cada um precisa do seu espelho. Listar só os diretórios que
+ * aparecem como `cwd` de gate não resolve: o teste de `asyncHandler` importa
+ * `shared/types/node_modules/zod` de propósito, para provar que um ZodError
+ * vindo de outra cópia do zod ainda vira 400.
+ *
+ * Não desce dentro de `node_modules` (esses são dependências aninhadas e já
+ * vêm pelo junction do pai) nem segue symlink/junction, para não entrar em
+ * laço.
+ */
+export function diretoriosNodeModules(base, profundidadeMax = 3) {
+  const achados = []
+
+  function andar(rel, profundidade) {
+    if (profundidade > profundidadeMax) return
+    let entradas
+    try {
+      entradas = readdirSync(join(base, rel), { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const e of entradas) {
+      if (e.isSymbolicLink()) continue
+      if (!e.isDirectory()) continue
+      const r = rel ? join(rel, e.name) : e.name
+      if (e.name === 'node_modules') {
+        achados.push(r)
+        continue
+      }
+      if (e.name === '.git' || e.name === 'dist' || e.name === 'build' || e.name === 'coverage') continue
+      andar(r, profundidade + 1)
+    }
+  }
+
+  andar('', 0)
+  return achados
+}
+
+/**
  * Em Windows, junction (symlink de diretório) em vez de cópia. `symlinkSync` com
  * 'junction' não precisa de privilégio de administrador.
+ *
+ * Espelha TODO `node_modules` do repo base, não só a raiz. Um repo tem um
+ * `node_modules` por pacote, e o gate roda em vários deles (`backend/`), e o
+ * código de teste pode importar de outro (`shared/types/`). Espelhar só a raiz
+ * fazia o gate rodar num worktree sem dependência e falhar com "tsc não é
+ * reconhecido" — falha de ambiente vestida de falha de código.
  */
-export function prepararAmbiente(worktree, repoBase) {
-  const dirNodeModules = join(worktree, 'node_modules')
-  const origem = join(repoBase, 'node_modules')
+export function prepararAmbiente(worktree, repoBase, subdirs = []) {
+  const alvos = [...new Set([...diretoriosNodeModules(repoBase), ...subdirs.map((s) => join(s, 'node_modules'))])]
+  const criados = []
+  const ignorados = []
 
-  if (existsSync(dirNodeModules)) return { criado: false, motivo: 'já existe' }
-  if (!existsSync(origem)) return { criado: false, motivo: 'repo base sem node_modules' }
-
-  mkdirSync(worktree, { recursive: true })
-  try {
-    symlinkSync(origem, dirNodeModules, 'junction')
-    return { criado: true, origem }
-  } catch (err) {
-    return { criado: false, motivo: `junction falhou: ${err.message}` }
+  for (const alvo of alvos) {
+    const dir = join(worktree, alvo)
+    const origem = join(repoBase, alvo)
+    if (existsSync(dir)) {
+      ignorados.push(`${alvo}: já existe`)
+      continue
+    }
+    if (!existsSync(origem)) {
+      ignorados.push(`${alvo}: repo base sem ${alvo}`)
+      continue
+    }
+    mkdirSync(dirname(dir), { recursive: true })
+    try {
+      symlinkSync(origem, dir, 'junction')
+      criados.push(alvo)
+    } catch (err) {
+      ignorados.push(`${alvo}: junction falhou: ${err.message}`)
+    }
   }
+
+  return { criado: criados.length > 0, criados, ignorados }
 }
 
 /** Remove junction/symlink criado por prepararAmbiente (para não vazar handle). */
-export function limparAmbiente(worktree) {
-  const dir = join(worktree, 'node_modules')
-  if (!existsSync(dir)) return false
-  try {
-    rmSync(dir, { recursive: true, force: true })
-    return true
-  } catch {
-    return false
+export function limparAmbiente(worktree, subdirs = []) {
+  let removidos = 0
+  for (const alvo of [...new Set([...subdirs, ...diretoriosNodeModules(worktree)])]) {
+    const dir = join(worktree, alvo)
+    if (!existsSync(dir)) continue
+    try {
+      rmSync(dir, { recursive: true, force: true })
+      removidos++
+    } catch {
+      /* junction que não removesse é pior que vazar, mas não vale falhar o run */
+    }
   }
+  return removidos > 0
+}
+
+/** Subdiretórios que os gates de um componente usam como cwd. */
+export function subdiretoriosDeGate(gates = []) {
+  return [...new Set(gates.map((g) => g?.cwd).filter(Boolean))]
 }
 
 /**
@@ -264,34 +333,49 @@ export function revisar({ task, gates = [], permitirSujeira = false }) {
   }
 
   // 6. Gates reais.
+  //
+  // `preparar: true` roda antes dos demais e existe para ferramentas que
+  // geram artefato a partir do código (o caso é o Prisma: o client vive dentro
+  // de node_modules e precisa ser regerado quando o schema muda). Verificar
+  // antes de preparar checa código novo contra artefato velho e produz erro de
+  // tipo que não existe.
   const resultadosGates = []
-  for (const g of gates) {
-    const cwd = g.cwd ? join(worktree, g.cwd) : worktree
-    if (!existsSync(join(cwd, 'package.json'))) {
-      const msg = `Gate "${g.nome}" pulado: ${join(g.cwd || '.', 'package.json')} não existe no worktree`
-      if (g.obrigatorio) criticos.push(msg)
-      else avisos.push(msg)
-      resultadosGates.push({ nome: g.nome, ok: null, pulado: true, motivo: msg })
-      continue
-    }
-    const r = rodarGate({ gate: g, cwd })
-    resultadosGates.push({ nome: g.nome, ...r })
-    if (!r.ok) {
-      const ultimas = (r.stderr || r.stdout).trim().split('\n').slice(-4).join(' | ')
-      const causa = r.erroSpawn ? `falha ao rodar: ${r.erroSpawn}` : `exit ${r.exitCode}`
-      const meusArquivos = [...arquivosCommitados, ...sujos]
+  const preparo = gates.filter((g) => g.preparar)
+  const verificacao = gates.filter((g) => !g.preparar)
 
-      if (g.obrigatorio && culpaDaTask(r, meusArquivos)) {
-        criticos.push(
-          `Gate "${g.nome}" falhou (${causa}) apontando para arquivo desta task. Últimas linhas: ${ultimas}`,
-        )
-      } else if (g.obrigatorio) {
-        avisos.push(
-          `Gate "${g.nome}" falhou (${causa}), mas a falha não aponta para nenhum arquivo desta task — ` +
-            `conteúdo pré-existente ou de outra task. Revalidado na integração. Últimas linhas: ${ultimas}`,
-        )
-      } else {
-        avisos.push(`Gate "${g.nome}" falhou (${causa}). Últimas linhas: ${ultimas}`)
+  for (const [fase, lista] of [['preparar', preparo], ['verificar', verificacao]]) {
+    for (const g of lista) {
+      const cwd = g.cwd ? join(worktree, g.cwd) : worktree
+      if (!existsSync(join(cwd, 'package.json'))) {
+        const msg = `Gate "${g.nome}" pulado: ${join(g.cwd || '.', 'package.json')} não existe no worktree`
+        if (g.obrigatorio) criticos.push(msg)
+        else avisos.push(msg)
+        resultadosGates.push({ nome: g.nome, fase, ok: null, pulado: true, motivo: msg })
+        continue
+      }
+      const r = rodarGate({ gate: g, cwd })
+      resultadosGates.push({ nome: g.nome, fase, ...r })
+      if (!r.ok) {
+        const ultimas = (r.stderr || r.stdout).trim().split('\n').slice(-4).join(' | ')
+        const causa = r.erroSpawn ? `falha ao rodar: ${r.erroSpawn}` : `exit ${r.exitCode}`
+        const meusArquivos = [...arquivosCommitados, ...sujos]
+
+        // Falha de preparação é sempre da task: sem o artefato, nada foi
+        // verificado de verdade. Não dá para culpar "conteúdo pré-existente".
+        if (fase === 'preparar') {
+          criticos.push(`Preparação "${g.nome}" falhou (${causa}). Últimas linhas: ${ultimas}`)
+        } else if (g.obrigatorio && culpaDaTask(r, meusArquivos)) {
+          criticos.push(
+            `Gate "${g.nome}" falhou (${causa}) apontando para arquivo desta task. Últimas linhas: ${ultimas}`,
+          )
+        } else if (g.obrigatorio) {
+          avisos.push(
+            `Gate "${g.nome}" falhou (${causa}), mas a falha não aponta para nenhum arquivo desta task — ` +
+              `conteúdo pré-existente ou de outra task. Revalidado na integração. Últimas linhas: ${ultimas}`,
+          )
+        } else {
+          avisos.push(`Gate "${g.nome}" falhou (${causa}). Últimas linhas: ${ultimas}`)
+        }
       }
     }
   }
