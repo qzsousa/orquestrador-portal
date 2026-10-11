@@ -272,11 +272,32 @@ function gatesDasTasks(cfg, tasks) {
  * ainda assim é fast-forward apenas: se a branch de integração tiver overtaken
  * a main de forma não-lineares, o comando falha em vez de criar um merge
  * commit surpresa. Nenhum push é feito em nenhum momento.
+ *
+ * `commitIntegracao` é o HEAD do worktree de integração — o RESULTADO. Passar o
+ * base (de onde a integração partiu) aqui faz o fast-forward não mover nada e
+ * ainda reportar sucesso: `main: 1c78db2 → 1c78db2`. Foi o que aconteceu.
  */
-export function aplicarNaPrincipal({ repo, baseSha, branchPrincipal }) {
+export function aplicarNaPrincipal({ repo, commitIntegracao, branchPrincipal }) {
   const antes = git.revParse(branchPrincipal, repo)
-  git.run(['merge', '--ff-only', baseSha], { cwd: repo })
-  return { branchPrincipal, antes, depois: git.revParse('HEAD', repo) }
+
+  if (!commitIntegracao || commitIntegracao === antes) {
+    throw new Error(
+      `Nada a aplicar: a integração não produziu commit novo ` +
+        `(branch principal e integração estão em ${antes.slice(0, 7)}).`,
+    )
+  }
+
+  git.run(['merge', '--ff-only', commitIntegracao], { cwd: repo })
+  const depois = git.revParse('HEAD', repo)
+
+  if (depois === antes) {
+    throw new Error(
+      `O fast-forward não moveu ${branchPrincipal} (continua em ${antes.slice(0, 7)}). ` +
+        `A integração aponta para ${commitIntegracao.slice(0, 7)}, que não é descendente da principal.`,
+    )
+  }
+
+  return { branchPrincipal, antes, depois }
 }
 
 /** Limpa worktrees de integração que não estão mais em uso. */

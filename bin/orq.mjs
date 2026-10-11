@@ -459,7 +459,10 @@ async function cmdIntegrate(flags, pos) {
         log(p(C.bold, '\n  Aplicando na branch principal (--aplicar)...'))
         const aplicado = aplicarNaPrincipal({
           repo,
-          baseSha: rel.integracao.baseSha,
+          // O HEAD do worktree de integração: o resultado. `baseSha` é de onde
+          // a integração partiu — usá-lo faz o fast-forward não mover nada e
+          // ainda reportar "main: X → X" como sucesso.
+          commitIntegracao: git.revParse('HEAD', rel.integracao.worktree),
           branchPrincipal: rel.integracao.branchPrincipal,
         })
         log(p(C.green, `  ✓ ${aplicado.branchPrincipal}: ${aplicado.antes.slice(0, 7)} → ${aplicado.depois.slice(0, 7)}`))
