@@ -12,11 +12,11 @@
  * pessoa, com `orq integrate --aplicar`.
  */
 
-import { existsSync } from 'node:fs'
+import { existsSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import * as git from './git.mjs'
 import { ordemDeIntegracao, conflitosEntreBranches } from './scheduler.mjs'
-import { prepararAmbiente, limparAmbiente, rodarGate, subdiretoriosDeGate } from './review.mjs'
+import { prepararAmbiente, limparAmbiente, rodarGate, subdiretoriosDeGate, diretoriosNodeModules } from './review.mjs'
 
 /**
  * Prepara o worktree de integração. Base = branch principal no momento da
@@ -27,8 +27,22 @@ export function prepararIntegracao({ cfg, repo, nome = 'integracao', gates = [] 
   const dir = join(cfg.worktreesDir, '__integracao__', nome)
   const branch = `${cfg.integrationBranchPrefix}/${nome}`
 
+  // Residuo da rodada anterior. O worktree carrega junctions de node_modules,
+  // que seguram o diretório e fazem removerWorktree falhar; o git também
+  // recusa apagar a branch enquanto o worktree existir. Deixar esse lixo
+  // bloqueava toda integração seguinte com "Diretório de worktree já existe".
   if (existsSync(dir)) {
-    git.removerWorktree(repo, dir, { forcar: true })
+    for (const alvo of diretoriosNodeModules(dir)) {
+      try {
+        rmSync(join(dir, alvo), { recursive: true, force: true })
+      } catch {}
+    }
+    try {
+      git.removerWorktree(repo, dir, { forcar: true })
+    } catch {}
+    try {
+      rmSync(dir, { recursive: true, force: true })
+    } catch {}
   }
 
   // Registro de worktree cujo diretório já não existe (interrupção, limpeza
