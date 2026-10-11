@@ -43,6 +43,13 @@ export function montarBriefing({ cfg, task, worktree, branch, baseSha, docs = []
     'Trabalhe apenas nos arquivos do seu escopo. Se precisar de arquivo de outro componente, PARE e reporte — não edite.',
     'Ao terminar, deixe a árvore limpa: tudo commitado.',
     'Não crie documentação duplicando o que já existe em /docs. Atualize o capítulo existente se precisar registrar algo.',
+    '',
+    'REGRA DE ORÇAMENTO (obrigatória):',
+    'Você tem uma janela curta. Comece a editar DEPOIS de no máximo ~8 leituras de arquivo.',
+    'Não tente entender o projeto inteiro. Ler mais não é progredir.',
+    'Se em ~20 turnos você ainda não tiver escrito código, pare, commite o que tiver (se houver algo) e reporte onde travou.',
+    'Uma tarefa entregue pela metade e explicada vale mais que uma tarefa não entregue.',
+    'Prefira o caminho menor: reuse o que já existe em vez de reconstruir.',
   ].join('\n')
 
   const escopo = (task.arquivosAlvo || []).length
@@ -95,6 +102,8 @@ Regra de contexto: leia os capítulos acima e os arquivos do escopo. NÃO leia o
 ## Verificação obrigatória antes de terminar
 ${comandos.length ? comandos.join('\n') : '  (sem gate automático configurado para este componente — rode o que o projeto oferecer)'}
 Se um gate falhar, NÃO deixe quebrado: investigue e conserte, ou reporte o bloqueio com o erro exato.
+Rode o gate ANTES de escrever muito código: se o gate já nasce vermelho por um
+motivo que não é seu, você precisa saber disso cedo para não depurar errado.
 
 ## Restrições (inegociáveis)
 ${restricoes}
