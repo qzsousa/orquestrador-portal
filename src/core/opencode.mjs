@@ -35,6 +35,31 @@ export class OpencodeError extends Error {
   }
 }
 
+/**
+ * Autenticação do servidor.
+ *
+ * O `opencode serve` só exige auth quando `OPENCODE_SERVER_PASSWORD` está no
+ * ambiente — e o OpenCode Desktop deixa a variável lá para o desktop falar com
+ * o servidor. Aí `orq run` sobe o próprio `opencode serve`, o filho herda a
+ * variável e responde 401 em TUDO, inclusive em `/global/health`. Sem este
+ * header o orquestrador concluiria que o servidor não subiu e reclamaria de
+ * timeout, que é a mensagem errada para a causa real.
+ *
+ * A credencial nunca sai do ambiente: lemos as duas variáveis e montamos o
+ * Basic. Ela não vai para log, nem para o estado, nem para o repo.
+ */
+function cabecalhoAuth() {
+  const senha = process.env.OPENCODE_SERVER_PASSWORD
+  if (!senha) return null
+  const usuario = process.env.OPENCODE_SERVER_USERNAME || 'opencode'
+  return `Basic ${Buffer.from(`${usuario}:${senha}`).toString('base64')}`
+}
+
+/** 401/403 tem conserto próprio; sem isto a mensagem seria só o status. */
+function ehAuth(status) {
+  return status === 401 || status === 403
+}
+
 /** Fala com um servidor opencode já no ar. */
 export class OpencodeClient {
   constructor({ host = '127.0.0.1', port = PORTA_PADRAO, fetchImpl = fetch } = {}) {
@@ -49,15 +74,31 @@ export class OpencodeClient {
     }
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), timeoutMs)
+    const headers = {}
+    const auth = cabecalhoAuth()
+    if (auth) headers.authorization = auth
+    if (body) headers['content-type'] = 'application/json'
     try {
       const res = await this.fetch(url, {
         method: modo,
-        headers: body ? { 'content-type': 'application/json' } : undefined,
+        headers: Object.keys(headers).length ? headers : undefined,
         body: body ? JSON.stringify(body) : undefined,
         signal: stream ? undefined : controller.signal,
       })
       if (!res.ok) {
         const texto = await res.text().catch(() => '')
+        if (ehAuth(res.status) && !auth) {
+          throw new OpencodeError(
+            `${modo} ${caminho} -> HTTP ${res.status}: o servidor exige autenticação e nenhuma foi enviada.`,
+            {
+              status: res.status,
+              body: texto,
+              dica:
+                'Defina OPENCODE_SERVER_USERNAME e OPENCODE_SERVER_PASSWORD no ambiente do orq, ' +
+                'iguais às do opencode que ele vai subir.',
+            },
+          )
+        }
         throw new OpencodeError(`${modo} ${caminho} -> HTTP ${res.status}: ${texto.slice(0, 500)}`, {
           status: res.status,
           body: texto,
@@ -97,17 +138,80 @@ export class OpencodeClient {
     })
   }
 
-  /**
-   * Envia prompt e ESPERA o agente terminar. Síncrono de propósito: o
-   * orquestrador precisa saber que a task acabou para poder revisar, e um
-   * `prompt_async` + polling casper seria mais código sem ganho de confiabilidade.
-   */
-  async enviarPrompt({ sessionID, texto, agent, timeoutMs = 1800000 }) {
-    const resposta = await this.request('POST', `/session/${sessionID}/message`, {
-      body: { parts: [{ type: 'text', text: texto }], agent },
-      timeoutMs,
+/**
+ * Só ESPERA um turno já em andamento terminar. Não envia nada.
+ *
+ * Usado pela reanexão: quando o orquestrador morre no meio, o agente continua
+ * working no servidor e o turno segue lá. Reanexar é voltar a olhar, não
+ * mandar o briefing de novo.
+ */
+async enviarPromptAguardar({ sessionID, timeoutMs = 1800000, intervaloMs = 3000, log = () => {}, cancelado }) {
+    const limite = Date.now() + timeoutMs
+    while (Date.now() < limite) {
+      if (cancelado?.()) {
+        throw new OpencodeError(`Turno abandonado: ${cancelado.motivo || 'a task mudou de estado'}`, { status: 'cancelado' })
+      }
+      const mensagens = await this.request('GET', `/session/${sessionID}/message`, { timeoutMs: 30000 })
+      const ultima = mensagens?.[mensagens.length - 1]
+      if (!ultima || ultima.info?.role !== 'assistant') {
+        await new Promise((r) => setTimeout(r, intervaloMs))
+        continue
+      }
+      if (ultima.info?.time?.completed) return ultima
+      log(`      ${ultima.info.id} ainda trabalhando (${ultima.parts?.length ?? 0} parts)`)
+      await new Promise((r) => setTimeout(r, intervaloMs))
+    }
+    throw new OpencodeError(`Agente não terminou em ${Math.round(timeoutMs / 1000)}s`, { status: 'timeout' })
+  }
+
+/**
+ * Envia o briefing e espera o agente terminar.
+ *
+ * Não dá para usar o `POST /session/{id}/message` síncrono aqui. Ele segura a
+ * conexão sem mandar nenhum byte até o agente acabar, e o `fetch` do Node mata
+ * a requisição por `headersTimeout` — 300s por padrão no undici. Uma task de5
+ * minutos morre com `fetch failed` mesmo com o `AbortController` do orq em
+ * 45min: quem corta é a camada HTTP, não a nossa. Foi o que reprovou a primeira
+ * rodada com as três tasks, todas no mesmo milissegundo.
+ *
+ * A saída é `prompt_async` (204, não bloqueia) + polling de `GET /messages`.
+ * Cada requisição é curta, então o timeout de header nunca entra. O turno
+ * acabou quando a última mensagem de assistant tem `time.completed` — enquanto
+ * estiver vazio, o agente ainda está trabalhando.
+ *
+ * `agent` não vai no corpo: a sessão já foi criada com ele, e repetir o campo
+ * faz o OpenCode resolver de novo a config do agente — o bloco `permissions`
+ * do frontmatter entra no request ao provider, e quem não conhece esse
+ * parâmetro responde 400 (`Unsupported parameter(s): 'permissions'`).
+ *
+ * `cancelado()` é consultado a cada volta do laço. Parar de ESPERAR não é o
+ * bastante: o agente continua escrevendo no worktree do servidor, e a task pode
+ * já estar bloqueada ou cancelada — resultado é trabalho num worktree que ninguém
+ * vai revisar, commitado por um runner que achou que tinha parado. Quem detecta
+ * a mudança de estado é o chamador; quem corta o turno é este `POST .../abort`.
+ */
+async enviarPrompt({ sessionID, texto, timeoutMs = 1800000, intervaloMs = 3000, log = () => {}, cancelado }) {
+    await this.request('POST', `/session/${sessionID}/prompt_async`, {
+      body: { parts: [{ type: 'text', text: texto }] },
+      timeoutMs: 60000,
     })
-    return resposta
+
+    const limite = Date.now() + timeoutMs
+    while (Date.now() < limite) {
+      if (cancelado?.()) {
+        // Abortar ANTES de consultar mensagens: o turno ainda está rodando no
+        // servidor, e ele que precisa ser cortado.
+        await this.abortar(sessionID)
+        throw new OpencodeError(`Turno abortado: ${cancelado.motivo || 'a task mudou de estado'}`, { status: 'cancelado' })
+      }
+      await new Promise((r) => setTimeout(r, intervaloMs))
+      const mensagens = await this.request('GET', `/session/${sessionID}/message`, { timeoutMs: 30000 })
+      const ultima = mensagens?.[mensagens.length - 1]
+      if (!ultima || ultima.info?.role !== 'assistant') continue
+      if (ultima.info?.time?.completed) return ultima
+      log(`      ${ultima.info.id} ainda trabalhando (${ultima.parts?.length ?? 0} parts)`)
+    }
+    throw new OpencodeError(`Agente não terminou em ${Math.round(timeoutMs / 1000)}s`, { status: 'timeout' })
   }
 
   abortar(sessionID) {
@@ -187,6 +291,47 @@ export class OpencodeClient {
 }
 
 /**
+ * Onde está o executável do `opencode`.
+ *
+ * No Windows, o npm instala `opencode` como um shim: `opencode.cmd` e
+ * `opencode.ps1` no diretório global, que na verdade chamam
+ * `node_modules/opencode-ai/bin/opencode.exe`. `spawn('opencode', ...)` sem
+ * `shell: true` procura o arquivo com nome exato e não acha o shim — falha com
+ * ENOENT. E a saída fácil, `shell: true`, é o que o resto do orquestrador
+ * evita de propósito: os argumentos viram string de shell.
+ *
+ * A saída é a mesma do `npm` em review.mjs: achar o executável real e spawnar
+ * ele direto. `where` é o mecanismo do próprio Windows para isso.
+ */
+let alvoOpencode = null
+function comandoOpencode() {
+  if (alvoOpencode) return alvoOpencode
+  if (process.platform !== 'win32') return 'opencode'
+
+  try {
+    const out = execFileSync('where', ['opencode'], { encoding: 'utf8', windowsHide: true })
+    const candidatos = out.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
+    // O .exe é o que dá para executar sem shell; .cmd/.bat exigiriam shell.
+    const exe = candidatos.find((c) => c.toLowerCase().endsWith('.exe'))
+    if (exe && existsSync(exe)) {
+      alvoOpencode = exe
+      return alvoOpencode
+    }
+  } catch {}
+
+  // Fallback: o layout padrão do npm global no Windows.
+  const appdata = process.env.APPDATA
+  if (appdata) {
+    const guess = join(appdata, 'npm', 'node_modules', 'opencode-ai', 'bin', 'opencode.exe')
+    if (existsSync(guess)) {
+      alvoOpencode = guess
+      return alvoOpencode
+    }
+  }
+  return 'opencode'
+}
+
+/**
  * Ciclo de vida do `opencode serve`.
  *
  * Um servidor para todas as tasks, não um por task: subir um servidor custa
@@ -240,7 +385,7 @@ export class OpencodeServer {
     const err = openSync(join(this.logDir, `opencode-serve-${this.port}.err.log`), 'a')
 
     const child = spawn(
-      'opencode',
+      comandoOpencode(),
       ['serve', '--port', String(this.port), '--hostname', this.host],
       { detached: true, stdio: ['ignore', out, err], windowsHide: true },
     )

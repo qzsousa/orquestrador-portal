@@ -18,7 +18,7 @@ import { join } from 'node:path'
 import * as git from './git.mjs'
 import { extrairTexto, extrairErros, extrairFerramentas } from './opencode.mjs'
 import { prepararAmbiente } from './review.mjs'
-import { repoDoComponente, componentesDaTask, docsRelevantes } from './config.mjs'
+import { repoDoComponente, componentesDaTask, docsRelevantes, modeloDoComponente } from './config.mjs'
 
 /**
  * Monta o briefing do agente.
@@ -124,6 +124,27 @@ Se NÃO conseguiu cumprir algum critério, diga NA VERDADE qual e por quê. Uma 
 }
 
 /**
+ * O agente ainda pode estar certo se a PARADA for do orquestrador.
+ *
+ * Três casos, e o tratamento é o mesmo por um motivo só: em nenhum deles o
+ * orquestrador vai ler o relatório.
+ *
+ *   - timeout       → a task já passou de `cfg.taskTimeoutMs`; o bloco de
+ *                     rescue commita o que houver e manda para revisão.
+ *   - cancelado     → alguém mexeu no estado (ou outro processo qualquer);
+ *   - estado mudou  → `orq stop`, um `orq resume` concorrente, ou o lock.
+ *
+ * O que NAO e motivo para commitar e estado que não seja `em-andamento`: se a
+ * task foi marcada `bloqueada` por outra via, o commit automático vira autoria
+ * sobre um trabalho que ninguém pediu.
+ */
+function recuperavel(err, estadoAtual) {
+  if (err.status === 'timeout') return true
+  if (err.status === 'cancelado') return true
+  return estadoAtual === 'em-andamento'
+}
+
+/**
  * Executa uma task do início ao portão de revisão.
  * Nunca lança por falha do agente: devolve um registro e deixa o estado falar.
  */
@@ -140,11 +161,18 @@ export async function executarTask({ cfg, store, task, client, log = () => {} })
   const componentePrincipal = comps[0]
   const repo = repoDoComponente(cfg, componentePrincipal)
 
+  // Fora do try de propósito: o caminho de timeout precisa saber onde está o
+  // worktree e qual era o commit base, para salvar o trabalho em vez de
+  // descartá-lo. Dentro do try, o catch não enxergaria nenhuma das duas.
+  const worktree = join(cfg.worktreesDir, task.id, componentePrincipal)
+  let baseShaGuardado = task.baseSha || null
+  /** Motivo do abort, preenchido pelo `cancelado` quando a task muda de estado. */
+  let abortado = null
+
   try {
     // --- 1. Ambiente isolado -------------------------------------------
     const branch = git.branchParaTask(task.id, task.titulo, cfg.branchPrefix)
     const baseRef = task.baseRef || cfg.componentes[componentePrincipal]?.branch || 'HEAD'
-    const worktree = join(cfg.worktreesDir, task.id, componentePrincipal)
 
     if (existsSync(worktree)) {
       throw new Error(`Worktree já existe em ${worktree}. Use "orq recover" ou remova antes de reexecutar.`)
@@ -152,6 +180,7 @@ export async function executarTask({ cfg, store, task, client, log = () => {} })
 
     log(`[${task.id}] worktree: ${worktree}`)
     const wt = git.criarWorktree({ repo, dir: worktree, branch, baseRef })
+    baseShaGuardado = wt.baseSha
     registro.etapas.push({ etapa: 'worktree', ok: true, worktree, branch, baseSha: wt.baseSha })
 
     const env = prepararAmbiente(worktree, repo)
@@ -168,6 +197,7 @@ export async function executarTask({ cfg, store, task, client, log = () => {} })
       directory: worktree,
       agent: cfg.agentes.worker,
       title: `orq ${task.id}: ${task.titulo}`,
+      model: modeloDoComponente(cfg, componentePrincipal),
       metadata: { orqTaskId: task.id, componente: componentePrincipal },
     })
     if (!sessao?.id) throw new Error('OpenCode não devolveu sessionID ao criar a sessão')
@@ -190,8 +220,24 @@ export async function executarTask({ cfg, store, task, client, log = () => {} })
     const resposta = await client.enviarPrompt({
       sessionID: sessao.id,
       texto: briefing,
-      agent: cfg.agentes.worker,
       timeoutMs: cfg.taskTimeoutMs,
+      log,
+      // O laço do cliente pergunta isto a cada volta. Sem ele, `orq stop` (ou um
+      // `orq resume` concorrente, ou o lock) marcava a task como parada enquanto o
+      // agente continuava editando o worktree por mais 45 minutos — e o commit
+      // de rescue depois do timeout trazia esse trabalho junto, como se fosse
+      // intencional. A sessão é abortada no mesmo instante em que a mudança de
+      // estado é vista, não quando o runner percebe.
+      cancelado: () => {
+        if (abortado) return true
+        const agora = store.obter(task.id)
+        if (!agora) return true
+        if (agora.estado !== 'em-andamento') {
+          abortado = `task está em "${agora.estado}", não em "em-andamento"`
+          return true
+        }
+        return false
+      },
     })
 
     const textoAgente = extrairTexto(resposta)
@@ -255,7 +301,45 @@ export async function executarTask({ cfg, store, task, client, log = () => {} })
   } catch (err) {
     registro.erro = err.message
     registro.fim = new Date().toISOString()
+    if (abortado) registro.abortado = abortado
     log(`[${task.id}] FALHOU: ${err.message}`)
+
+    // Tempo esgotado NÃO é motivo para jogar trabalho fora. O agente pode ter
+    // passado 40min escrevendo codigo valido e o timeout ter chegado no meio do
+    // relatorio final. Sem este bloco, a task vira `bloqueada` com centenas de
+    // linhas abandonadas no worktree e o proximo `run` recomeca do zero - foi o
+    // que aconteceu com T-002 e T-003: 573 e 545 linhas prontas, descartadas.
+    //
+    // O mesmo vale quando o ABORT foi do proprio orquestrador: o agente estava
+    // no meio de um trabalho legitimo e a parada veio de fora. O que nao vale e
+    // commitar quando a task ja estava em outro estado - ai ninguem pediu esse
+    // trabalho e o commit automatico vira autoria sobre trabalho fantasma.
+    if (worktree && existsSync(worktree) && !git.arvoreLimpa(worktree)) {
+      let estadoAtual = null
+      try {
+        estadoAtual = store.obter(task.id)?.estado ?? null
+      } catch {
+        /* state indisponível: cai na regra conservadora de nao commitar */
+      }
+      if (recuperavel(err, estadoAtual)) {
+        try {
+          log(`[${task.id}] ${err.status === 'cancelado' ? 'turno abortado' : 'tempo esgotado'}, mas ha trabalho no worktree - commitando para nao perder`)
+          return finalizarTask({
+            cfg, store, task,
+            worktree,
+            baseSha: baseShaGuardado,
+            textoAgente: '',
+            commitForcado: null,
+            registro, log,
+          })
+        } catch (erroFinal) {
+          log(`[${task.id}] nao deu para salvar o trabalho: ${erroFinal.message}`)
+        }
+      } else {
+        log(`[${task.id}] turno parado com a task em "${estadoAtual}" - trabalho deixado no worktree, sem commit automatico`)
+      }
+    }
+
     try {
       const atual = store.obter(task.id)
       if (atual && atual.estado === 'em-andamento') {
@@ -269,6 +353,126 @@ export async function executarTask({ cfg, store, task, client, log = () => {} })
     } catch {
       /* estado já pode ter sido movido; não mascara o erro original */
     }
+    return registro
+  }
+}
+
+/**
+ * Fecha a task depois que o agente terminou: commita o que ele deixou, recolhe
+ * commits e arquivos e joga no portão de revisão.
+ *
+ * Extraído de `executarTask` porque a reanexão (`orq resume`) chega exatamente
+ * aqui: o agente já rodou e já commitou, só falta o orquestrador voltar e fazer
+ * a parte mecânica. Sem extrair, essa lógica viveria duplicada e as duas
+ * cópias divergiriam — que é como revisão passa a aprovar task sem commit.
+ */
+function finalizarTask({ cfg, store, task, worktree, baseSha, textoAgente, commitForcado, registro, log }) {
+  if (!baseSha) {
+    registro.erro = 'Sem commit base conhecido: não dá para medir o que a task mudou.'
+    return registro
+  }
+  if (!git.arvoreLimpa(worktree)) {
+    const sujos = git.arquivosNaoCommitados(worktree)
+    const msg = `feat(${task.id}): ${task.titulo}\n\nTask: ${task.id}\nCommitado pelo orquestrador: o agente deixou trabalho sem commit.`
+    commitForcado = git.commitar(worktree, msg)
+    log(`[${task.id}] commit forçado pelo orquestrador (${sujos.length} arquivo(s))`)
+  }
+
+  const commits = git.commitsDesde(worktree, baseSha)
+  const arquivos = git.arquivosAfetados(worktree, baseSha)
+
+  if (!commits.length) {
+    store.mudarEstado(task.id, 'bloqueada', { arquivosAlterados: arquivos }, 'Nenhum commit após execução')
+    registro.erro = 'Nenhum commit produzido. A task não alterou nada.'
+    registro.fim = new Date().toISOString()
+    return registro
+  }
+
+  store.mudarEstado(
+    task.id,
+    'aguardando-revisao',
+    {
+      commits,
+      arquivosAlterados: arquivos,
+      resultado: {
+        resumo: primeiroBloco(textoAgente, 'Resumo'),
+        texto: textoAgente,
+        commitForcado: Boolean(commitForcado),
+        reanexado: true,
+      },
+    },
+    'Execução concluída; aguardando revisão',
+  )
+  registro.etapas.push({ etapa: 'commit', ok: true, commits: commits.length, commitForcado })
+  registro.ok = true
+  registro.fim = new Date().toISOString()
+  return registro
+}
+
+/**
+ * Reanexa uma task que ficou `em-andamento` porque o orquestrador morreu (Ctrl+C,
+ * terminal fechado) enquanto o agente continuava working no servidor.
+ *
+ * O agente NÃO é redespachado: a sessão e o worktree já existem, e mandar o
+ * briefing de novo faria o agente recomeçar do zero e duplicar o trabalho. Só
+ * se espera o turno atual acabar e se faz a finalização mecânica.
+ */
+export async function reanexarTask({ cfg, store, task, client, log = () => {} }) {
+  const registro = { taskId: task.id, inicio: new Date().toISOString(), ok: false, etapas: [], erro: null }
+
+  if (!task.sessionID) {
+    registro.erro = `${task.id} não tem sessão para reanexar`
+    store.mudarEstado(task.id, 'bloqueada', { erros: [registro.erro] }, registro.erro)
+    return registro
+  }
+  if (!task.worktree || !existsSync(task.worktree)) {
+    registro.erro = `${task.id} não tem worktree válido`
+    store.mudarEstado(task.id, 'bloqueada', { erros: [registro.erro] }, registro.erro)
+    return registro
+  }
+
+  try {
+    log(`[${task.id}] reanexando na sessão ${task.sessionID}`)
+    // Mesma regra do runner: se a task não está mais `em-andamento`, o turno em
+    // andamento no servidor é de outra execução e esperar por ele só gastaria o
+    // timeout inteiro antes de alguém perceber.
+    let abortado = null
+    const resposta = await client.enviarPromptAguardar({
+      sessionID: task.sessionID,
+      timeoutMs: cfg.taskTimeoutMs,
+      log,
+      cancelado: () => {
+        if (abortado) return true
+        const agora = store.obter(task.id)
+        if (!agora || agora.estado !== 'em-andamento') {
+          abortado = `task está em "${agora?.estado ?? 'desconhecido'}", não em "em-andamento"`
+          return true
+        }
+        return false
+      },
+    })
+
+    const textoAgente = extrairTexto(resposta)
+    const errosAgente = extrairErros(resposta)
+    registro.etapas.push({ etapa: 'execucao', ok: errosAgente.length === 0, erros: errosAgente })
+
+    if (errosAgente.length) {
+      store.mudarEstado(task.id, 'bloqueada', { erros: errosAgente }, 'Agente reportou erro interno')
+      registro.erro = `Agente reportou erro: ${errosAgente.join('; ')}`
+      registro.fim = new Date().toISOString()
+      return registro
+    }
+
+    return finalizarTask({
+      cfg, store, task,
+      worktree: task.worktree,
+      baseSha: task.baseSha,
+      textoAgente, commitForcado: null, registro, log,
+    })
+  } catch (err) {
+    registro.erro = err.message
+    registro.fim = new Date().toISOString()
+    log(`[${task.id}] FALHOU na reanexão: ${err.message}`)
     return registro
   }
 }
