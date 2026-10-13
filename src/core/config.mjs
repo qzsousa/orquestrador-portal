@@ -98,6 +98,18 @@ export const PADRAO = {
   },
   /** Timeout de uma task (ms). Tarefas grandes existem; 45min é o padrão. */
   taskTimeoutMs: 45 * 60 * 1000,
+  /**
+   * Modelo que os agentes usam, no formato que a API do OpenCode espera:
+   * `{ providerID, id }` — sem `modelID`, que é rejeitado com 400.
+   *
+   * Fechar o modelo não é vaidade: o endpoint de um provider pode TRAVAR no
+   * meio de uma geração, sem erro e sem timeout do lado dele. Sem modelo
+   * fixado, a task inteira fica pendurada até o timeout de 45min. Ver
+   * `orq status`: task `em-andamento` que não cresce é provider travado.
+   *
+   * `null` = usa o default do servidor.
+   */
+  modelo: null,
   /** Teto de tentativas antes de marcar como falhou. */
   maxTentativas: 2,
   /** Onde os worktrees das tasks nascem. Fora de qualquer repo de produto. */
@@ -150,6 +162,17 @@ export async function carregarConfig() {
   cfg.raiz = RAIZ_ORQ
   cache = cfg
   return cfg
+}
+
+/**
+ * Modelo de um componente, com o global como reserva.
+ *
+ * `@property {string} providerID` ex.: `opencode`, `nvidia`
+ * @property {string} id` ex.: `step-5-preview-free`
+ */
+export function modeloDoComponente(cfg, nome) {
+  const doComp = cfg.componentes[nome]?.modelo
+  return doComp || cfg.modelo || null
 }
 
 /** Caminho absoluto do repo de um componente, validando que ele existe. */

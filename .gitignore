@@ -1,6 +1,11 @@
 # Estado de execucao (recuperavel, mas local e derivado)
 .state/
 
+# Config local: tem caminho absoluto desta maquina. Versionar
+# `C:/Users/<voce>/Desktop/...` quebraria o clone no outro PC. O que e
+# portavel esta em bin/seed-tasks.mjs e em orq.config.exemplo.mjs.
+orq.config.mjs
+
 # Worktrees das tarefas. Fica FORA do repo de produto de proposito: o worktree
 # e um clone de trabalho, nao fonte. Nunca versionar.
 worktrees/
