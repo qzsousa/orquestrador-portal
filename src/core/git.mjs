@@ -198,19 +198,25 @@ function worktreeListEverywhere(path) {
  * Cria worktree + branch de uma task, sempre a partir de um commit pinado.
  *
  * Fixar o base é o que torna a integração previsível: se a main andar durante
- * a execução, a task não muda deIcamento embaixo dos pés, e o orquestrador
- * decide explicitamente quando rebasear ou reprocessar.
+ * a execução, a task não muda de lugar embaixo dos pés, e o orquestrador
+ * decide explicitamente quando reprocessar.
  */
-export function criarWorktree({ repo, dir, branch, baseRef = 'HEAD' }) {
+export function criarWorktree({ repo, dir, branch, baseRef = 'HEAD', reaproveitarBranch = false }) {
   if (existsSync(dir)) {
     throw new GitError(`Diretório de worktree já existe: ${dir}`)
   }
-  if (branchExists(branch, repo)) {
+  const branchJaExiste = branchExists(branch, repo)
+  if (branchJaExiste && !reaproveitarBranch) {
     throw new GitError(`Branch já existe: ${branch}`)
+  }
+  if (branchJaExiste) {
+    // Sem `-b`: o git apenas reconecta a worktree na branch existente.
+    run(['worktree', 'add', dir, branch], { cwd: repo })
+    return { branch, worktree: dir, baseSha: revParse(branch, repo), repo, reaproveitada: true }
   }
   const baseSha = revParse(baseRef, repo)
   run(['worktree', 'add', '-b', branch, dir, baseSha], { cwd: repo })
-  return { branch, worktree: dir, baseSha, repo }
+  return { branch, worktree: dir, baseSha, repo, reaproveitada: false }
 }
 
 export function removerWorktree(repo, dir, { forcar = false } = {}) {

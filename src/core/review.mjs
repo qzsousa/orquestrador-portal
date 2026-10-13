@@ -12,9 +12,10 @@
  */
 
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, symlinkSync, rmSync } from 'node:fs'
+import { existsSync, rmSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import * as git from './git.mjs'
+import { prepararWorktree, limparWorktree } from './preparar-worktree.mjs'
 
 /**
  * Como rodar o npm.
@@ -42,35 +43,38 @@ function alvoNpm() {
 }
 
 /**
- * Em Windows, junction (symlink de diretório) em vez de cópia. `symlinkSync` com
- * 'junction' não precisa de privilégio de administrador.
+ * Prepara o ambiente de um worktree.
+ *
+ * A implementação mora em `preparar-worktree.mjs`, e não aqui, porque ela é
+ * compartilhada com a integração — que precisa do mesmo ambiente, pelas mesmas
+ * razões, e que já falhava exatamente como o runner falhava. Ter duas cópias
+ * garantiria que uma delas se desfaz.
+ *
+ * O resumo do que a função faz e por quê está no arquivo dela; o essencial:
+ * junction de `node_modules` por pacote, relink de dependência `file:` para
+ * DENTRO do worktree e build dos pacotes locais.
+ *
+ * Este export continua existindo porque o runner e a revisão o chamam por este
+ * nome; é o mesmo comportamento, agora com o ambiente inteiro.
  */
-export function prepararAmbiente(worktree, repoBase) {
-  const dirNodeModules = join(worktree, 'node_modules')
-  const origem = join(repoBase, 'node_modules')
-
-  if (existsSync(dirNodeModules)) return { criado: false, motivo: 'já existe' }
-  if (!existsSync(origem)) return { criado: false, motivo: 'repo base sem node_modules' }
-
-  mkdirSync(worktree, { recursive: true })
-  try {
-    symlinkSync(origem, dirNodeModules, 'junction')
-    return { criado: true, origem }
-  } catch (err) {
-    return { criado: false, motivo: `junction falhou: ${err.message}` }
-  }
+export function prepararAmbiente(worktree, repoBase, opcoes = {}) {
+  return prepararWorktree({ worktree, repoBase, ...opcoes })
 }
 
-/** Remove junction/symlink criado por prepararAmbiente (para não vazar handle). */
-export function limparAmbiente(worktree) {
-  const dir = join(worktree, 'node_modules')
-  if (!existsSync(dir)) return false
-  try {
-    rmSync(dir, { recursive: true, force: true })
-    return true
-  } catch {
-    return false
+/** Limpa o ambiente. Devolve o que NÃO conseguiu remover, em vez de engolir. */
+export function limparAmbiente(worktree, repoBase = null, opcoes = {}) {
+  if (!repoBase) {
+    // Chamada legada, sem repo base: só o `node_modules` da raiz.
+    const dir = join(worktree, 'node_modules')
+    if (!existsSync(dir)) return { removidos: [], falhas: [] }
+    try {
+      rmSync(dir, { recursive: true, force: true })
+      return { removidos: ['node_modules'], falhas: [] }
+    } catch (err) {
+      return { removidos: [], falhas: [`node_modules: ${err.message}`] }
+    }
   }
+  return limparWorktree({ worktree, repoBase, ...opcoes })
 }
 
 /**
