@@ -55,7 +55,15 @@ export const COMPONENTES_PADRAO = {
     // contra tipos de schema antigo e acusa erro que não existe. O projeto já
     // faz essa etapa no Dockerfile e no render.yaml; o gate só precisa
     // espelhar o build de produção.
+    //
+    // `shared/types` entra na frente pela mesma razão, uma etapa antes: é um
+    // pacote COMPILADO, e o backend lê o `dist/api.d.ts`. Um worktree novo não
+    // tem `dist` — só o repo base tem, espelhado por junction, com o contrato
+    // antigo. Sem este gate, qualquer task que mexa em `shared/types` falha o
+    // typecheck com "has no exported member" para símbolos que existem no
+    // código, e parece bug de código em vez de ambiente faltando.
     gates: [
+      { nome: 'shared:build', args: ['run', 'build'], obrigatorio: true, cwd: 'shared/types', preparar: true },
       { nome: 'prisma:generate', args: ['run', 'prisma:generate'], obrigatorio: true, cwd: 'backend', preparar: true },
       { nome: 'typecheck', args: ['run', 'typecheck'], obrigatorio: true, cwd: 'backend' },
       { nome: 'test', args: ['test'], obrigatorio: true, cwd: 'backend' },

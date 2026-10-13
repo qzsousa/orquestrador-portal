@@ -202,13 +202,28 @@ export async function executarTask({ cfg, store, task, client, log = () => {} })
       docs,
     })
 
-    const resposta = await client.enviarPrompt({
-      sessionID: sessao.id,
-      texto: briefing,
-      agent: cfg.agentes.worker,
-      directory: worktree,
-      timeoutMs: cfg.taskTimeoutMs,
-    })
+    // O agente precisa PARAR aqui, não só ter respondido. `enviarPrompt` volta
+    // quando o servidor aceita a resposta, e aí o agente segue trabalhando em
+    // segundo plano: o orquestrador commita o que existe, marca a task e segue
+    // para a próxima — enquanto a sessão ainda escreve no worktree.
+    //
+    // Foi o que aconteceu na T-005: um `tsconfig.gate.json` apareceu depois do
+    // commit, um teste editado sumiu do disco, e o gate passou a medir uma
+    // árvore em movimento. Um agente que continua depois de a task ter mudado de
+    // estado invalida revisão, gate e integração — os três leem o worktree.
+    // Abortar é o que torna a fronteira "a task parou" real.
+    let resposta
+    try {
+      resposta = await client.enviarPrompt({
+        sessionID: sessao.id,
+        texto: briefing,
+        agent: cfg.agentes.worker,
+        directory: worktree,
+        timeoutMs: cfg.taskTimeoutMs,
+      })
+    } finally {
+      await client.abortar(sessao.id)
+    }
 
     const textoAgente = extrairTexto(resposta)
     const errosAgente = extrairErros(resposta)
