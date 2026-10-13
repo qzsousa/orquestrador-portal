@@ -12,7 +12,7 @@
  * pessoa, com `orq integrate --aplicar`.
  */
 
-import { existsSync } from 'node:fs'
+import { existsSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import * as git from './git.mjs'
 import { ordemDeIntegracao, conflitosEntreBranches } from './scheduler.mjs'
@@ -22,18 +22,46 @@ import { prepararAmbiente, limparAmbiente, rodarGate } from './review.mjs'
  * Prepara o worktree de integração. Base = branch principal no momento da
  * integração (não o base da task): é contra a main que a mudança precisa provar
  * que funciona.
+ *
+ * O ambiente é o mesmo que o do runner, pelos mesmos motivos: dependência
+ * `file:` que aponta para a árvore base faria o gate ler o contrato de outra
+ * árvore, e era o que fazia a integração passar com um `dist` velho.
  */
-export function prepararIntegracao({ cfg, repo, nome = 'integracao' }) {
+export function prepararIntegracao({ cfg, repo, nome = 'integracao', log = () => {} }) {
   const dir = join(cfg.worktreesDir, '__integracao__', nome)
   const branch = `${cfg.integrationBranchPrefix}/${nome}`
 
+  // Idempotência: reexecutar a integração NÃO pode destruir o resultado da
+  // anterior. A branch é o registro do que já foi integrado; recriá-la do zero a
+  // cada `orq integrate` fazia o mesmo lote ser integrado várias vezes, com um
+  // merge commit vazio por task a cada rodada. Então reconecta nela quando ela
+  // existe, e só cria da main quando não existe — e nesse caso, por definição,
+  // não há resultado anterior para perder.
+  const reaproveitada = git.branchExists(branch, repo)
   if (existsSync(dir)) {
     git.removerWorktree(repo, dir, { forcar: true })
+    // Sobra de uma remoção anterior: o git limpa o conteúdo mas devolve a pasta,
+    // e `worktree remove` não a remove porque ela não está mais na lista dele.
+    // Sem esta linha, a integração seguinte morre em "diretório já existe" — e a
+    // mensagem aponta para o diretório, não para o worktree órfão que o causou.
+    if (existsSync(dir)) {
+      rmSync(dir, { recursive: true, force: true })
+      git.run(['worktree', 'prune'], { cwd: repo })
+    }
   }
+
   const mainBranch = git.branchAtual(repo)
-  const wt = git.criarWorktree({ repo, dir, branch, baseRef: mainBranch })
-  prepararAmbiente(dir, repo)
-  return { ...wt, branchPrincipal: mainBranch }
+  const wt = git.criarWorktree({ repo, dir, branch, baseRef: mainBranch, reaproveitarBranch: true })
+  const ambiente = prepararAmbiente(dir, repo, { log })
+
+  // `base` é o ponto de DIVERGÊNCIA com a main, não o commit de criação. Com a
+  // branch reaproveitada, o commit de criação é a própria branch — usá-lo como
+  // base faria o relatório de commits mostrar zero, sempre.
+  const baseSha = reaproveitada
+    ? git.tentar(['merge-base', mainBranch, branch], { cwd: repo }) || wt.baseSha
+    : wt.baseSha
+
+  return { ...wt, baseSha, branchPrincipal: mainBranch, reaproveitada, ambiente }
 }
 
 /**
@@ -89,7 +117,23 @@ export function integrar({ cfg, tasks, repo, nome = 'integracao' }) {
   // falha por definição, porque as outras duas ainda não entraram. Validar no
   // meio do caminho reprovaria toda integração que tenha mais de uma task.
   for (const task of ordenadas) {
-    const r = { taskId: task.id, branch: task.branch, ok: false, conflito: null, erro: null }
+    const r = { taskId: task.id, branch: task.branch, ok: false, conflito: null, erro: null, jaIntegrada: false }
+
+    // Idempotência: uma branch cujos commits já são ancestrais do HEAD da
+    // integração já entrou. Sem esta checagem, a segunda rodada de `orq
+    // integrate` criaria um merge vazio por task e o relatório mostraria "3
+    // tasks integradas" para o mesmo lote, com o diff de sempre.
+    //
+    // O HEAD é o DO WORKTREE DE INTEGRAÇÃO. Comparar com o `HEAD` do repo seria
+    // comparar com a main, e nenhuma branch de task é ancestral da main — a
+    // checagem nunca passaria e a idempotência não existiria.
+    if (git.isAncestor(integracao.worktree, task.branch, 'HEAD')) {
+      r.ok = true
+      r.jaIntegrada = true
+      relatorio.resultados.push(r)
+      continue
+    }
+
     try {
       // --no-commit + --no-ff: se houver conflito, NADA é gravado e o worktree
       // volta ao estado anterior. Merge atômico por task.
@@ -105,7 +149,12 @@ export function integrar({ cfg, tasks, repo, nome = 'integracao' }) {
         break
       }
 
-      git.run(['commit', '-m', `merge(${task.id}): ${task.titulo}`], { cwd: integracao.worktree })
+      // Merge que não mudou nada (branch já contida no HEAD por outro caminho)
+      // não gera commit: um merge commit vazio polui o histórico da main com um
+      // registro que não corresponde a trabalho nenhum.
+      if (!git.arvoreLimpa(integracao.worktree)) {
+        git.run(['commit', '-m', `merge(${task.id}): ${task.titulo}`], { cwd: integracao.worktree })
+      }
       r.ok = true
     } catch (err) {
       // Merge já committed ou abortado: garante estado limpo para o próximo.
@@ -198,19 +247,43 @@ function gatesDasTasks(cfg, tasks) {
  *
  * Só chega aqui por `orq integrate --aplicar`, que exige a flag explícita. E
  * ainda assim é fast-forward apenas: se a branch de integração tiver overtaken
- * a main de forma não-lineares, o comando falha em vez de criar um merge
+ * a main de forma não-linear, o comando falha em vez de criar um merge
  * commit surpresa. Nenhum push é feito em nenhum momento.
  */
-export function aplicarNaPrincipal({ repo, baseSha, branchPrincipal }) {
+export function aplicarNaPrincipal({ repo, branchIntegracao, baseSha, branchPrincipal }) {
+  // Merge pela BRANCH, e não pelo `baseSha`: com a integração idempotente a
+  // branch pode ter sido reaproveitada de uma rodada anterior, e o `baseSha` é o
+  // ponto de divergência com a main — trazer ele para a main seria um no-op que
+  // "aplica" sem aplicar nada e ainda assim marca as tasks como concluídas.
+  const ref = branchIntegracao || baseSha
   const antes = git.revParse(branchPrincipal, repo)
-  git.run(['merge', '--ff-only', baseSha], { cwd: repo })
+  git.run(['merge', '--ff-only', ref], { cwd: repo })
   return { branchPrincipal, antes, depois: git.revParse('HEAD', repo) }
 }
 
-/** Limpa worktrees de integração que não estão mais em uso. */
-export function limparIntegracao({ repo, dir }) {
-  if (!existsSync(dir)) return false
-  git.removerWorktree(repo, dir, { forcar: true })
-  limparAmbiente(dir)
-  return true
+/**
+ * Limpa worktrees de integração que não estão mais em uso.
+ *
+ * Devolve o que NÃO conseguiu limpar. A versão anterior devolvia `false` e
+ * engolia a causa: uma junction que sobrou faz o próximo `orq integrate` recusar
+ * o diretório, e a mensagem que aparecia falava do diretório, não da junction.
+ */
+export function limparIntegracao({ repo, dir, log = () => {} }) {
+  if (!existsSync(dir)) return { removido: false, falhas: [] }
+  const falhas = []
+  let removido = false
+  try {
+    git.removerWorktree(repo, dir, { forcar: true })
+    // O `git worktree remove` limpa o conteúdo e devolve a pasta vazia. Sem
+    // este passo, `existsSync` continua respondendo "sim" e a próxima chamada
+    // diria "removido" de novo, sem ter removido nada.
+    if (existsSync(dir)) rmSync(dir, { recursive: true, force: true })
+    git.run(['worktree', 'prune'], { cwd: repo })
+    removido = true
+  } catch (err) {
+    falhas.push(`worktree: ${err.message}`)
+  }
+  const ambiente = limparAmbiente(dir, repo, { log })
+  falhas.push(...ambiente.falhas.map((f) => `ambiente: ${f}`))
+  return { removido, falhas }
 }

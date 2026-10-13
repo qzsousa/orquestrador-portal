@@ -17,13 +17,13 @@
  *   orq trello-sync               importa cards do Trello
  */
 
-import { existsSync } from 'node:fs'
-import { join } from 'node:path'
+import { existsSync, readdirSync, rmSync } from 'node:fs'
+import { join, dirname } from 'node:path'
 import { TaskStore } from '../src/core/taskstore.mjs'
 import { carregarConfig, repoDoComponente, componentesDaTask } from '../src/core/config.mjs'
 import { OpencodeClient, OpencodeServer } from '../src/core/opencode.mjs'
-import { executarTask } from '../src/core/runner.mjs'
-import { revisar, avaliarCriterios } from '../src/core/review.mjs'
+import { executarTask, reanexarTask } from '../src/core/runner.mjs'
+import { revisar, avaliarCriterios, limparAmbiente } from '../src/core/review.mjs'
 import { integrar, aplicarNaPrincipal, limparIntegracao } from '../src/core/integration.mjs'
 import { reconciliarEstados, selecionarDespachaveis, motivoBloqueio } from '../src/core/scheduler.mjs'
 import * as planner from '../src/core/planner.mjs'
@@ -418,16 +418,26 @@ async function cmdIntegrate(flags, pos) {
     log(`tasks: ${lista.map((t) => t.id).join(', ')}`)
     log(`ordem: ${planner.ordenarTopologicamente(lista).map((t) => t.id).join(' → ')}\n`)
 
-    const rel = integrar({ cfg, tasks: lista, repo, nome: repo.split(/[\\/]/).pop() })
+    const rel = integrar({ cfg, tasks: lista, repo, nome: repo.split(/[\\/]/).pop(), log })
 
     for (const c of rel.conflitos) {
       log(`  ${p(C.yellow, '⚠')} conflito previsto ${c.a} × ${c.b}: ${c.arquivos.slice(0, 4).join(', ')}`)
     }
     for (const r of rel.resultados) {
-      log(`  ${r.ok ? p(C.green, '✓') : p(C.red, '✗')} ${r.taskId}${r.erro ? `  ${r.erro}` : ''}`)
+      const marca = r.ok ? p(C.green, '✓') : p(C.red, '✗')
+      const sufixo = r.jaIntegrada ? p(C.dim, ' (já integrada nesta rodada anterior)') : ''
+      log(`  ${marca} ${r.taskId}${r.erro ? `  ${r.erro}` : ''}${sufixo}`)
     }
     for (const g of rel.gates) {
       log(`     ${g.ok ? p(C.green, '✓') : p(C.red, '✗')} ${g.cmd} (${(g.duracaoMs / 1000).toFixed(1)}s)`)
+    }
+
+    // O ambiente do worktree de integração é o mesmo do runner: junction por
+    // pacote, dependência `file:` relinkada PARA DENTRO do worktree e build dos
+    // pacotes locais. Sem o build, o gate lia o `dist` do contrato de outra
+    // árvore e aprovava uma mudança de contrato que nunca tinha sido compilada.
+    for (const pr of rel.integracao?.ambiente?.problemas || []) {
+      log(`  ${p(C.yellow, '⚠')} ambiente: ${pr}`)
     }
 
     log('')
@@ -444,6 +454,7 @@ async function cmdIntegrate(flags, pos) {
         log(p(C.bold, '\n  Aplicando na branch principal (--aplicar)...'))
         const aplicado = aplicarNaPrincipal({
           repo,
+          branchIntegracao: rel.branchIntegracao,
           baseSha: rel.integracao.baseSha,
           branchPrincipal: rel.integracao.branchPrincipal,
         })
@@ -558,6 +569,55 @@ async function cmdRecover() {
   log('Revise as bloqueadas com "orq status" e "orq run".\n')
 }
 
+/**
+ * Reanexa tasks que ficaram `em-andamento` porque o orquestrador morreu.
+ *
+ * O `recover` reconcilia estado; este volta na sessão. O agente que ficou
+ * working no servidor não é reiniciado — reanexar é esperar o turno atual
+ * acabar e então commitar e revisar, que é o que o orquestrador morreu fazendo.
+ */
+async function cmdResume(flags) {
+  const cfg = await carregarConfig()
+  const store = storeDe(cfg)
+
+  let alvos = store.porEstado('em-andamento')
+  if (flags.id) alvos = alvos.filter((t) => t.id === flags.id)
+
+  if (!alvos.length) {
+    log(p(C.dim, 'Nenhuma task em-andamento para reanexar.'))
+    return
+  }
+
+  const server = new OpencodeServer({ port: cfg.opencode.port, host: cfg.opencode.host, stateDir: cfg.stateDir, logDir: cfg.logDir })
+  await server.garantir()
+  const client = new OpencodeClient({ port: cfg.opencode.port, host: cfg.opencode.host })
+
+log(p(C.bold, `\nReanexando ${alvos.length} task(s)\n`))
+
+  // Em paralelo, e não em sequência: uma task presa dentro de `npm run build`
+  // segura as outras por horas se a espera for serial. `orq run` já despacha
+  // em paralelo; reanexar faz o mesmo pelo mesmo motivo.
+  const resultados = await Promise.all(
+    alvos.map(async (t) => {
+      if (!t.sessionID) {
+        log(p(C.yellow, `  ${t.id}: sem sessão — não há o que reanexar`))
+        return { id: t.id, registro: { erro: 'sem sessão' } }
+      }
+      const registro = await reanexarTask({ cfg, store, task: t, client, log: (m) => log(p(C.dim, m)) })
+      return { id: t.id, registro, titulo: t.titulo }
+    }),
+  )
+
+  for (const { id, registro, titulo } of resultados) {
+    log(
+      registro.ok
+        ? p(C.green, `  ✓ ${id} — ${titulo}`)
+        : p(C.red, `  ✗ ${id} — ${registro.erro}`),
+    )
+  }
+  log('\nRode "orq status" e depois "orq review --todos".\n')
+}
+
 /* ------------------------------------------------------------------ clean */
 
 async function cmdClean(flags, pos) {
@@ -583,6 +643,18 @@ async function cmdClean(flags, pos) {
   if (task.branch) {
     try {
       const repo = git.commonDir(task.worktree)
+      // A junction de node_modules criada por prepararAmbiente segura o
+      // diretório: o `git worktree remove` limpa o conteúdo mas devolve o
+      // worktree como pasta vazia, e a próxima execução morre em "worktree já
+      // existe". Tira a junction antes.
+      //
+      // E o que NÃO conseguiu tirar é reportado: a versão anterior engolia o
+      // erro e a mensagem seguinte era sobre o diretório, mandando a pessoa
+      // procurar o problema no lugar errado.
+      const limpeza = limparAmbiente(task.worktree, repo)
+      if (limpeza.falhas?.length) {
+        log(p(C.yellow, `  ⚠ ${limpeza.falhas.length} junction(s) não removida(s): ${limpeza.falhas.join('; ')}`))
+      }
       git.removerWorktree(repo, task.worktree, { forcar: true })
       if (git.branchExists(task.branch, repo)) {
         git.run(['branch', '-D', task.branch], { cwd: repo, allowDestructive: true })
@@ -591,6 +663,13 @@ async function cmdClean(flags, pos) {
     } catch (err) {
       erro(`Falha ao limpar: ${err.message}`)
     }
+  }
+  // Sobra de remoção anterior: diretório vazio que o git não leva junto.
+  if (task.worktree && existsSync(task.worktree) && !readdirSync(task.worktree).length) {
+    try {
+      rmSync(task.worktree, { recursive: true, force: true })
+      rmSync(dirname(task.worktree), { recursive: true, force: true })
+    } catch {}
   }
   store.remover(id)
 }
@@ -663,6 +742,7 @@ const COMANDOS = {
   integrate: cmdIntegrate,
   dep: cmdDep,
   recover: cmdRecover,
+  resume: cmdResume,
   clean: cmdClean,
   'trello-sync': cmdTrelloSync,
   'install-agents': cmdInstallAgents,
