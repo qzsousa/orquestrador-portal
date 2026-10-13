@@ -49,19 +49,24 @@ export const COMPONENTES_PADRAO = {
     rotulo: 'Backend de chamados (Node + Express + Prisma)',
     repo: 'C:/Users/Pablo/Desktop/chamados',
     branch: 'main',
-    // `prisma:generate` primeiro, e `preparar: true`, porque o client gerado do
-    // Prisma mora dentro de node_modules — que o orquestrador compartilha com o
-    // repo base por junction. Sem regenerar, o typecheck compara código novo
-    // contra tipos de schema antigo e acusa erro que não existe. O projeto já
-    // faz essa etapa no Dockerfile e no render.yaml; o gate só precisa
-    // espelhar o build de produção.
+    // Três etapas de preparação, nesta ordem — e a ordem importa.
     //
-    // `shared/types` entra na frente pela mesma razão, uma etapa antes: é um
-    // pacote COMPILADO, e o backend lê o `dist/api.d.ts`. Um worktree novo não
-    // tem `dist` — só o repo base tem, espelhado por junction, com o contrato
-    // antigo. Sem este gate, qualquer task que mexa em `shared/types` falha o
-    // typecheck com "has no exported member" para símbolos que existem no
-    // código, e parece bug de código em vez de ambiente faltando.
+    // `shared:build` primeiro: `shared/types` é um pacote COMPILADO e o
+    // backend lê o `dist/api.d.ts`. Um worktree novo não tem `dist` — só o repo
+    // base tem, espelhado por junction, com o contrato antigo. Sem esta etapa,
+    // qualquer task que mexa no contrato falha o typecheck com "has no exported
+    // member" para símbolos que existem no código: parece bug de código e é
+    // ambiente faltando.
+    //
+    // `prisma:generate` depois, e `preparar: true`: o client gerado do Prisma
+    // mora dentro de node_modules — que o orquestrador compartilha com o repo
+    // base por junction. Sem regenerar, o typecheck compara código novo contra
+    // tipos de schema antigo e acusa erro que não existe. O projeto já faz essa
+    // etapa no Dockerfile e no render.yaml; o gate só espelha o build de
+    // produção.
+    //
+    // Typecheck e suíte (vitest) por último: sem estes a task do backend seria
+    // aceita sem nenhuma verificação automatizada.
     gates: [
       { nome: 'shared:build', args: ['run', 'build'], obrigatorio: true, cwd: 'shared/types', preparar: true },
       { nome: 'prisma:generate', args: ['run', 'prisma:generate'], obrigatorio: true, cwd: 'backend', preparar: true },
