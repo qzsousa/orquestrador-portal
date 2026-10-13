@@ -45,7 +45,10 @@ const TRANSICOES = {
   pronta: ['em-andamento', 'bloqueada', 'falhou', 'aguardando-dependencia'],
   'em-andamento': ['aguardando-revisao', 'bloqueada', 'falhou', 'pronta'],
   'aguardando-revisao': ['aguardando-integracao', 'em-andamento', 'bloqueada', 'falhou'],
-  bloqueada: ['pronta', 'aguardando-dependencia', 'falhou', 'em-andamento'],
+  // `aguardando-revisao` entra aqui por causa do `orq adopt`: quando o
+  // orquestrador perde a conexão mas o agente termina e commita, a task volta
+  // para revisão pelo caminho normal em vez de ficar presa em bloqueada.
+  bloqueada: ['pronta', 'aguardando-dependencia', 'falhou', 'em-andamento', 'aguardando-revisao'],
   'aguardando-integracao': ['concluida', 'em-andamento', 'bloqueada', 'falhou'],
   concluida: [],
   falhou: ['pronta', 'em-andamento'],

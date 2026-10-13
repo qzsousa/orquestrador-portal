@@ -12,69 +12,116 @@
  */
 
 import { spawnSync } from 'node:child_process'
-import { existsSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, rmSync, symlinkSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import * as git from './git.mjs'
 import { prepararWorktree, limparWorktree } from './preparar-worktree.mjs'
 
 /**
- * Como rodar o npm.
+ * Todos os `node_modules` de um repo, em caminho relativo a raiz.
  *
- * Desde o fix de segurança do Node (CVE-2024-27980), `spawn` de `npm.cmd`
- * sem `shell: true` falha com EINVAL no Windows. A saída fácil seria
- * `shell: true`, mas aí os argumentos viram string de shell e um título de
- * task com aspas viraria injeção de comando.
+ * Um repo nao tem UM `node_modules`, tem varios: a raiz, `backend/`,
+ * `frontend/`, `shared/types/`... O orquestrador espelha o diretorio inteiro via
+ * junction, entao cada um precisa do seu espelho. Listar so os diretorios que
+ * aparecem como `cwd` de gate nao resolve: o teste de `asyncHandler` importa
+ * `shared/types/node_modules/zod` de proposito, para provar que um ZodError
+ * vindo de outra copia do zod ainda vira 400.
  *
- * A saída correta: chamar o `npm-cli.js` pelo próprio node. Sem shell, sem
- * interpolação, e funciona igual em qualquer plataforma.
+ * Nao desce dentro de `node_modules` (esses sao dependencias aninhadas e ja
+ * vem pelo junction do pai) nem segue symlink/junction, para nao entrar em laco.
  */
-let npmAlvo = null
-function alvoNpm() {
-  if (npmAlvo) return npmAlvo
-  if (process.platform === 'win32') {
-    const cli = join(dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js')
-    if (existsSync(cli)) {
-      npmAlvo = { comando: process.execPath, prefixo: [cli] }
-      return npmAlvo
+export function diretoriosNodeModules(base, profundidadeMax = 3) {
+  const achados = []
+
+  function andar(rel, profundidade) {
+    if (profundidade > profundidadeMax) return
+    let entradas
+    try {
+      entradas = readdirSync(join(base, rel), { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const e of entradas) {
+      if (e.isSymbolicLink()) continue
+      if (!e.isDirectory()) continue
+      const r = rel ? join(rel, e.name) : e.name
+      if (e.name === 'node_modules') {
+        achados.push(r)
+        continue
+      }
+      if (e.name === '.git' || e.name === 'dist' || e.name === 'build' || e.name === 'coverage') continue
+      andar(r, profundidade + 1)
     }
   }
-  npmAlvo = { comando: process.platform === 'win32' ? 'npm' : 'npm', prefixo: [] }
-  return npmAlvo
+
+  andar('', 0)
+  return achados
+}
+
+/** Subdiretorios que os gates de um componente usam como cwd. */
+export function subdiretoriosDeGate(gates = []) {
+  return [...new Set(gates.map((g) => g?.cwd).filter(Boolean))]
 }
 
 /**
  * Prepara o ambiente de um worktree.
  *
- * A implementação mora em `preparar-worktree.mjs`, e não aqui, porque ela é
- * compartilhada com a integração — que precisa do mesmo ambiente, pelas mesmas
- * razões, e que já falhava exatamente como o runner falhava. Ter duas cópias
+ * A implementacao mora em `preparar-worktree.mjs`, e nao aqui, porque ela e
+ * compartilhada com a integracao -- que precisa do mesmo ambiente, pelas mesmas
+ * razoes, e que ja falhava exatamente como o runner falhava. Ter duas copias
  * garantiria que uma delas se desfaz.
  *
- * O resumo do que a função faz e por quê está no arquivo dela; o essencial:
- * junction de `node_modules` por pacote, relink de dependência `file:` para
- * DENTRO do worktree e build dos pacotes locais.
+ * Alem de espelhar todo `node_modules` por pacote, ela religa a dependencia
+ * `file:` para DENTRO do worktree e compila o pacote local. Sem o religamento,
+ * o gate `shared:build` compila um `dist` do worktree que NINGUEM consome,
+ * porque o `@shared/api` continua apontando para a arvore base -- e o typecheck
+ * continua lendo o contrato antigo. As duas metades so funcionam juntas.
  *
- * Este export continua existindo porque o runner e a revisão o chamam por este
- * nome; é o mesmo comportamento, agora com o ambiente inteiro.
+ * O terceiro argumento aceita as duas formas em uso: um array de subdiretorios
+ * (o que o runner e o `tools/preparar-worktree.mjs` passam) ou um objeto de
+ * opcoes. O retorno tem a forma antiga (`criado`/`criados`/`ignorados`) mais os
+ * campos novos, para nenhum dos dois lados quebrar.
  */
-export function prepararAmbiente(worktree, repoBase, opcoes = {}) {
-  return prepararWorktree({ worktree, repoBase, ...opcoes })
+export function prepararAmbiente(worktree, repoBase, subdirsOuOpcoes = []) {
+  const opcoes = Array.isArray(subdirsOuOpcoes) ? { subdirs: subdirsOuOpcoes } : subdirsOuOpcoes
+  const r = prepararWorktree({ worktree, repoBase, ...opcoes })
+  return {
+    ...r,
+    criado: r.pacotes.some((p) => p.criado),
+    criados: r.pacotes.filter((p) => p.criado).map((p) => p.dir),
+    ignorados: [
+      ...r.pacotes.filter((p) => !p.criado).map((p) => `${p.dir}: ${p.motivo}`),
+      ...r.problemas,
+    ],
+  }
 }
 
-/** Limpa o ambiente. Devolve o que NÃO conseguiu remover, em vez de engolir. */
-export function limparAmbiente(worktree, repoBase = null, opcoes = {}) {
-  if (!repoBase) {
-    // Chamada legada, sem repo base: só o `node_modules` da raiz.
-    const dir = join(worktree, 'node_modules')
-    if (!existsSync(dir)) return { removidos: [], falhas: [] }
-    try {
-      rmSync(dir, { recursive: true, force: true })
-      return { removidos: ['node_modules'], falhas: [] }
-    } catch (err) {
-      return { removidos: [], falhas: [`node_modules: ${err.message}`] }
+/**
+ * Limpa o ambiente, devolvendo o que NAO conseguiu remover em vez de engolir.
+ *
+ * O segundo argumento e o repo base (string) quando o chamador quer a limpeza
+ * completa por pacote, ou a lista de subdiretorios (array) no uso legado. Os
+ * dois tipos se distinguem, e a distincao mora aqui porque as duas chamadas vem
+ * de codigo escrito em momentos diferentes.
+ */
+export function limparAmbiente(worktree, repoBaseOuSubdirs = null, opcoes = {}) {
+  if (Array.isArray(repoBaseOuSubdirs) || repoBaseOuSubdirs === null) {
+    const subdirs = Array.isArray(repoBaseOuSubdirs) ? repoBaseOuSubdirs : []
+    const falhas = []
+    let quantos = 0
+    for (const alvo of [...new Set([...subdirs, ...diretoriosNodeModules(worktree)])]) {
+      const dir = join(worktree, alvo)
+      if (!existsSync(dir)) continue
+      try {
+        rmSync(dir, { recursive: true, force: true })
+        quantos++
+      } catch (err) {
+        falhas.push(`${alvo}: ${err.message}`)
+      }
     }
+    return { removido: quantos > 0, falhas }
   }
-  return limparWorktree({ worktree, repoBase, ...opcoes })
+  return limparWorktree({ worktree, repoBase: repoBaseOuSubdirs, ...opcoes })
 }
 
 /**
@@ -135,6 +182,36 @@ export function rodarGate({ gate, cwd, timeoutMs = 15 * 60 * 1000, env = {} }) {
 }
 
 /**
+ * Arquivos citados nas linhas de FALHA da saída do gate.
+ *
+ * O formato da saída é do runner de testes, e ele varia: vitest, um script
+ * próprio que só imprime "FALTA: x.ts", npm, make. Casar o formato de um
+ * runner deixa o resto cego — foi o que quebrou o E2E. Então a regra é a
+ * inversa: descarta as linhas que dizem que deu certo e considera todas as
+ * outras.
+ *
+ * Descartar as linhas de sucesso é o ponto. O vitest lista no resumo também
+ * os arquivos que passaram (` ✓ x.test.ts`), e a versão anterior da heurística
+ * varria a saída inteira: viu o nome de um arquivo que PASSOU e acusou a
+ * task de ter quebrado o gate. Foi assim que a T-003 foi reprovada.
+ */
+function arquivosQueFalharam(stdout, stderr) {
+  const texto = `${stdout || ''}\n${stderr || ''}`
+  const arquivos = new Set()
+  for (const linha of texto.split(/\r?\n/)) {
+    const limpo = linha.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').trim()
+    if (!limpo) continue
+    // Linha de sucesso: o arquivo citado nela passou.
+    if (/^[✓✔√]/.test(limpo)) continue
+    if (/\b(passed|passing)\b/i.test(limpo)) continue
+    for (const m of limpo.matchAll(/[\w.\-@/\\]+\.(?:ts|tsx|vue|js|mjs|json|md|css)/g)) {
+      arquivos.add(m[0])
+    }
+  }
+  return arquivos
+}
+
+/**
  * Atribui (ou não) a falha do gate a esta task.
  *
  * Um gate de repositório (build, suíte completa) mede o TODO o repositório,
@@ -146,17 +223,21 @@ export function rodarGate({ gate, cwd, timeoutMs = 15 * 60 * 1000, env = {} }) {
  * A regra: se a falha aponta para arquivo que ESTA task alterou, é culpa dela
  * (bloqueante). Se não aponta para nenhum arquivo dela, é sinalizado como
  * aviso e a validação real acontece na integração, sobre o conjunto completo.
+ *
+ * Limite conhecido, e vale registrar: a atribuição é por nome de arquivo. Uma
+ * task que quebra um teste cujo arquivo não tem o mesmo nome do arquivo que
+ * alterou (muda `usuarios.ts` e quebra um `usuarios.test.ts` de outro módulo)
+ * passa como aviso. Fechar essa brecha de vez exige comparar a suíte na base
+ * contra a suíte na head.
  */
-function culpaDaTask(gate, arquivosDaTask) {
-  const texto = `${gate.stdout || ''}\n${gate.stderr || ''}`
-  const citados = texto.match(/[\w.\-@/\\]+\.(?:ts|tsx|vue|js|mjs|json|md|css)/g) || []
+export function culpaDaTask(gate, arquivosDaTask) {
+  const falharam = arquivosQueFalharam(gate.stdout, gate.stderr)
   const meus = new Set((arquivosDaTask || []).map((f) => f.toLowerCase().replace(/\\/g, '/')))
   const meusBase = new Set([...meus].map((f) => f.split('/').pop()))
-  const tocaAlgoMeu = citados.some((c) => {
-    const cn = c.toLowerCase().replace(/\\/g, '/')
-    return meus.has(cn) || meusBase.has(cn.split('/').pop())
+  return [...falharam].some((f) => {
+    const fn = f.toLowerCase().replace(/\\/g, '/')
+    return meus.has(fn) || meusBase.has(fn.split('/').pop())
   })
-  return tocaAlgoMeu
 }
 
 /**
@@ -234,34 +315,49 @@ export function revisar({ task, gates = [], permitirSujeira = false }) {
   }
 
   // 6. Gates reais.
+  //
+  // `preparar: true` roda antes dos demais e existe para ferramentas que
+  // geram artefato a partir do código (o caso é o Prisma: o client vive dentro
+  // de node_modules e precisa ser regerado quando o schema muda). Verificar
+  // antes de preparar checa código novo contra artefato velho e produz erro de
+  // tipo que não existe.
   const resultadosGates = []
-  for (const g of gates) {
-    const cwd = g.cwd ? join(worktree, g.cwd) : worktree
-    if (!existsSync(join(cwd, 'package.json'))) {
-      const msg = `Gate "${g.nome}" pulado: ${join(g.cwd || '.', 'package.json')} não existe no worktree`
-      if (g.obrigatorio) criticos.push(msg)
-      else avisos.push(msg)
-      resultadosGates.push({ nome: g.nome, ok: null, pulado: true, motivo: msg })
-      continue
-    }
-    const r = rodarGate({ gate: g, cwd })
-    resultadosGates.push({ nome: g.nome, ...r })
-    if (!r.ok) {
-      const ultimas = (r.stderr || r.stdout).trim().split('\n').slice(-4).join(' | ')
-      const causa = r.erroSpawn ? `falha ao rodar: ${r.erroSpawn}` : `exit ${r.exitCode}`
-      const meusArquivos = [...arquivosCommitados, ...sujos]
+  const preparo = gates.filter((g) => g.preparar)
+  const verificacao = gates.filter((g) => !g.preparar)
 
-      if (g.obrigatorio && culpaDaTask(r, meusArquivos)) {
-        criticos.push(
-          `Gate "${g.nome}" falhou (${causa}) apontando para arquivo desta task. Últimas linhas: ${ultimas}`,
-        )
-      } else if (g.obrigatorio) {
-        avisos.push(
-          `Gate "${g.nome}" falhou (${causa}), mas a falha não aponta para nenhum arquivo desta task — ` +
-            `conteúdo pré-existente ou de outra task. Revalidado na integração. Últimas linhas: ${ultimas}`,
-        )
-      } else {
-        avisos.push(`Gate "${g.nome}" falhou (${causa}). Últimas linhas: ${ultimas}`)
+  for (const [fase, lista] of [['preparar', preparo], ['verificar', verificacao]]) {
+    for (const g of lista) {
+      const cwd = g.cwd ? join(worktree, g.cwd) : worktree
+      if (!existsSync(join(cwd, 'package.json'))) {
+        const msg = `Gate "${g.nome}" pulado: ${join(g.cwd || '.', 'package.json')} não existe no worktree`
+        if (g.obrigatorio) criticos.push(msg)
+        else avisos.push(msg)
+        resultadosGates.push({ nome: g.nome, fase, ok: null, pulado: true, motivo: msg })
+        continue
+      }
+      const r = rodarGate({ gate: g, cwd })
+      resultadosGates.push({ nome: g.nome, fase, ...r })
+      if (!r.ok) {
+        const ultimas = (r.stderr || r.stdout).trim().split('\n').slice(-4).join(' | ')
+        const causa = r.erroSpawn ? `falha ao rodar: ${r.erroSpawn}` : `exit ${r.exitCode}`
+        const meusArquivos = [...arquivosCommitados, ...sujos]
+
+        // Falha de preparação é sempre da task: sem o artefato, nada foi
+        // verificado de verdade. Não dá para culpar "conteúdo pré-existente".
+        if (fase === 'preparar') {
+          criticos.push(`Preparação "${g.nome}" falhou (${causa}). Últimas linhas: ${ultimas}`)
+        } else if (g.obrigatorio && culpaDaTask(r, meusArquivos)) {
+          criticos.push(
+            `Gate "${g.nome}" falhou (${causa}) apontando para arquivo desta task. Últimas linhas: ${ultimas}`,
+          )
+        } else if (g.obrigatorio) {
+          avisos.push(
+            `Gate "${g.nome}" falhou (${causa}), mas a falha não aponta para nenhum arquivo desta task — ` +
+              `conteúdo pré-existente ou de outra task. Revalidado na integração. Últimas linhas: ${ultimas}`,
+          )
+        } else {
+          avisos.push(`Gate "${g.nome}" falhou (${causa}). Últimas linhas: ${ultimas}`)
+        }
       }
     }
   }

@@ -4,12 +4,18 @@
 # Config local: tem caminho absoluto desta maquina. Versionar
 # `C:/Users/<voce>/Desktop/...` quebraria o clone no outro PC. O que e
 # portavel esta em bin/seed-tasks.mjs e em orq.config.exemplo.mjs.
-orq.config.mjs
+# orq.config.mjs  <- continua RASTREADO de proposito (o remoto ja o tem);
+#                    a regra acima vale para quem ainda nao o versionou.
 
-# Worktrees das tarefas. Fica FORA do repo de produto de proposito: o worktree
+# Worktrees das tasks. Fica FORA do repo de produto de proposito: o worktree
 # e um clone de trabalho, nao fonte. Nunca versionar.
 worktrees/
 .state-backup/
+
+# Worktrees que o E2E cria dentro deste proprio repo (o E2E roda com
+# worktreesDir apontando para cá). São repos git aninhados: se entrarem no
+# índice, o git passa a registrá-los como gitlink e o commit fica inservível.
+orq-worktrees/
 
 # Logs de execucao
 logs/

@@ -76,6 +76,12 @@ export default {
       repo: 'C:/Users/Pablo/Desktop/chamados',
       branch: 'main',
       gates: [
+        // `preparar: true` roda antes dos gates que verificam. Use para
+        // ferramenta que gera artefato a partir do codigo (Prisma, codegen) ou
+        // para pacote compilado que outro le (o `shared/types` deste projeto:
+        // o backend le o `dist/api.d.ts`, e um worktree novo nao tem `dist`).
+        { nome: 'shared:build', args: ['run', 'build'], obrigatorio: true, cwd: 'shared/types', preparar: true },
+        { nome: 'prisma:generate', args: ['run', 'prisma:generate'], obrigatorio: true, cwd: 'backend', preparar: true },
         { nome: 'typecheck', args: ['run', 'typecheck'], obrigatorio: true, cwd: 'backend' },
         { nome: 'test', args: ['test'], obrigatorio: true, cwd: 'backend' },
       ],

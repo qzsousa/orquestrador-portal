@@ -17,7 +17,7 @@ import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import * as git from './git.mjs'
 import { extrairTexto, extrairErros, extrairFerramentas } from './opencode.mjs'
-import { prepararAmbiente } from './review.mjs'
+import { prepararAmbiente, subdiretoriosDeGate } from './review.mjs'
 import { repoDoComponente, componentesDaTask, docsRelevantes, modeloDoComponente } from './config.mjs'
 
 /**
@@ -43,6 +43,13 @@ export function montarBriefing({ cfg, task, worktree, branch, baseSha, docs = []
     'Trabalhe apenas nos arquivos do seu escopo. Se precisar de arquivo de outro componente, PARE e reporte — não edite.',
     'Ao terminar, deixe a árvore limpa: tudo commitado.',
     'Não crie documentação duplicando o que já existe em /docs. Atualize o capítulo existente se precisar registrar algo.',
+    '',
+    'REGRA DE ORÇAMENTO (obrigatória):',
+    'Você tem uma janela curta. Comece a editar DEPOIS de no máximo ~8 leituras de arquivo.',
+    'Não tente entender o projeto inteiro. Ler mais não é progredir.',
+    'Se em ~20 turnos você ainda não tiver escrito código, pare, commite o que tiver (se houver algo) e reporte onde travou.',
+    'Uma tarefa entregue pela metade e explicada vale mais que uma tarefa não entregue.',
+    'Prefira o caminho menor: reuse o que já existe em vez de reconstruir.',
   ].join('\n')
 
   const escopo = (task.arquivosAlvo || []).length
@@ -95,6 +102,8 @@ Regra de contexto: leia os capítulos acima e os arquivos do escopo. NÃO leia o
 ## Verificação obrigatória antes de terminar
 ${comandos.length ? comandos.join('\n') : '  (sem gate automático configurado para este componente — rode o que o projeto oferecer)'}
 Se um gate falhar, NÃO deixe quebrado: investigue e conserte, ou reporte o bloqueio com o erro exato.
+Rode o gate ANTES de escrever muito código: se o gate já nasce vermelho por um
+motivo que não é seu, você precisa saber disso cedo para não depurar errado.
 
 ## Restrições (inegociáveis)
 ${restricoes}
@@ -183,7 +192,7 @@ export async function executarTask({ cfg, store, task, client, log = () => {} })
     baseShaGuardado = wt.baseSha
     registro.etapas.push({ etapa: 'worktree', ok: true, worktree, branch, baseSha: wt.baseSha })
 
-    const env = prepararAmbiente(worktree, repo)
+    const env = prepararAmbiente(worktree, repo, subdiretoriosDeGate(cfg.componentes[componentePrincipal]?.gates || []))
     registro.etapas.push({ etapa: 'ambiente', ok: true, ...env })
 
     store.atualizar(task.id, { worktree, branch, baseSha: wt.baseSha, baseRef }, 'worktree-criado', {
@@ -196,8 +205,19 @@ export async function executarTask({ cfg, store, task, client, log = () => {} })
     const sessao = await client.criarSessao({
       directory: worktree,
       agent: cfg.agentes.worker,
+      // Sem modelo explícito a sessão herda o padrão global da máquina. Isso
+      // couples o orquestrador à configuração de quem está rodando: quando o
+      // modelo padrão é rejeitado pelo provedor, toda task morre pelo mesmo
+      // motivo e o relatório não diz qual. Fixar aqui deixa a falha visível e
+      // troca de modelo é uma linha de config, não de código.
+      //
+      // O modelo do COMPONENTE tem precedência sobre o global do agente: é o
+      // que permite fixar um modelo só num componente que precisa, sem repetir
+      // o resto. `modeloDoComponente` já devolve null quando não há nada
+      // configurado, e `modeloDe(null)` devolve undefined — os dois aceitam as
+      // duas formas ("provider/modelo" e o objeto), então nenhum lado quebra.
+      model: modeloDe(modeloDoComponente(cfg, componentePrincipal) ?? cfg.agentes.workerModel),
       title: `orq ${task.id}: ${task.titulo}`,
-      model: modeloDoComponente(cfg, componentePrincipal),
       metadata: { orqTaskId: task.id, componente: componentePrincipal },
     })
     if (!sessao?.id) throw new Error('OpenCode não devolveu sessionID ao criar a sessão')
@@ -217,28 +237,44 @@ export async function executarTask({ cfg, store, task, client, log = () => {} })
       docs,
     })
 
-    const resposta = await client.enviarPrompt({
-      sessionID: sessao.id,
-      texto: briefing,
-      timeoutMs: cfg.taskTimeoutMs,
-      log,
-      // O laço do cliente pergunta isto a cada volta. Sem ele, `orq stop` (ou um
-      // `orq resume` concorrente, ou o lock) marcava a task como parada enquanto o
-      // agente continuava editando o worktree por mais 45 minutos — e o commit
-      // de rescue depois do timeout trazia esse trabalho junto, como se fosse
-      // intencional. A sessão é abortada no mesmo instante em que a mudança de
-      // estado é vista, não quando o runner percebe.
-      cancelado: () => {
-        if (abortado) return true
-        const agora = store.obter(task.id)
-        if (!agora) return true
-        if (agora.estado !== 'em-andamento') {
-          abortado = `task está em "${agora.estado}", não em "em-andamento"`
-          return true
-        }
-        return false
-      },
-    })
+// O agente precisa PARAR aqui — nos dois sentidos.
+    //
+    // (a) `enviarPrompt` volta quando o servidor aceita a resposta, e aí o agente
+    //     segue trabalhando em segundo plano: o orquestrador commita o que existe,
+    //     marca a task e segue para a próxima — enquanto a sessão ainda escreve no
+    //     worktree. Foi o que aconteceu na T-005: um `tsconfig.gate.json` apareceu
+    //     depois do commit, um teste editado sumiu do disco, e o gate passou a
+    //     medir uma árvore em movimento. O `finally` com `abortar` é o que torna a
+    //     fronteira "a task parou" real.
+    //
+    // (b) E antes disso: se a task já não está `em-andamento` — `orq stop`, um
+    //     `orq resume` concorrente, o lock — o `cancelado` derruba o turno no
+    //     instante em que a mudança é vista, e não quando o runner percebe.
+    //     Sem ele, o agente escrevia por mais 45 minutos e o commit de resgate do
+    //     timeout trazia esse trabalho junto, como se fosse intencional.
+    let resposta
+    try {
+      resposta = await client.enviarPrompt({
+        sessionID: sessao.id,
+        texto: briefing,
+        agent: cfg.agentes.worker,
+        directory: worktree,
+        timeoutMs: cfg.taskTimeoutMs,
+        log,
+        cancelado: () => {
+          if (abortado) return true
+          const agora = store.obter(task.id)
+          if (!agora) return true
+          if (agora.estado !== 'em-andamento') {
+            abortado = `task está em "${agora.estado}", não em "em-andamento"`
+            return true
+          }
+          return false
+        },
+      })
+    } finally {
+      await client.abortar(sessao.id)
+    }
 
     const textoAgente = extrairTexto(resposta)
     const errosAgente = extrairErros(resposta)
@@ -343,11 +379,25 @@ export async function executarTask({ cfg, store, task, client, log = () => {} })
     try {
       const atual = store.obter(task.id)
       if (atual && atual.estado === 'em-andamento') {
+        // Queda de transporte NÃO é falha do agente. O `opencode serve` é
+        // solto: ele continua executando o agente mesmo depois de o
+        // orquestrador morrer, e o agente pode commitar normalmente. Marcar
+        // como bloqueada com o texto cru do erro levava a pessoa a descartar
+        // trabalho que já estava pronto — que foi exatamente o que aconteceu
+        // com a T-003. Aqui a task fica bloqueada mas com o motivo certo e a
+        // instrução de recuperação.
+        const caiu = err.status === 'transporte' || err.status === 'timeout'
+        const motivo = caiu
+          ? `${err.message}. O orquestrador perdeu a conexão, mas o servidor do OpenCode ` +
+            `segue no ar e o agente pode ter terminado e commitado. ` +
+            `Rode "orq adopt ${task.id}" para recolher o que foi feito, ` +
+            `ou "orq run" para refazer do zero.`
+          : err.message
         const tentativas = atual.tentativa || 1
-        if (tentativas >= (cfg.maxTentativas || 2)) {
-          store.mudarEstado(task.id, 'falhou', { erros: [...(atual.erros || []), err.message] }, err.message)
+        if (!caiu && tentativas >= (cfg.maxTentativas || 2)) {
+          store.mudarEstado(task.id, 'falhou', { erros: [...(atual.erros || []), motivo] }, motivo)
         } else {
-          store.mudarEstado(task.id, 'bloqueada', { erros: [...(atual.erros || []), err.message] }, err.message)
+          store.mudarEstado(task.id, 'bloqueada', { erros: [...(atual.erros || []), motivo] }, motivo)
         }
       }
     } catch {
@@ -475,6 +525,28 @@ export async function reanexarTask({ cfg, store, task, client, log = () => {} })
     log(`[${task.id}] FALHOU na reanexão: ${err.message}`)
     return registro
   }
+
+/**
+ * Modelo da sessao, em qualquer uma das duas formas aceitas.
+ *
+ * "provider/modelo" -> { providerID, id }.
+ *
+ * O POST /session exige esse objeto e rejeita string solta com 400 — o schema
+ * e `additionalProperties: false` com `id` e `providerID` obrigatorios. Por isso
+ * a traducao acontece aqui e nao no servidor.
+ */
+function modeloDe(valor) {
+  if (!valor) return undefined
+  if (typeof valor === 'object') return valor
+  const i = String(valor).indexOf('/')
+  if (i < 1) return undefined
+  return { providerID: String(valor).slice(0, i), id: String(valor).slice(i + 1) }
+}
+  if (!valor) return undefined
+  if (typeof valor === 'object') return valor
+  const i = String(valor).indexOf('/')
+  if (i < 1) return undefined
+  return { providerID: String(valor).slice(0, i), id: String(valor).slice(i + 1) }
 }
 
 /** Pega a primeira seção markdown com o nome pedido (para o resumo no state). */

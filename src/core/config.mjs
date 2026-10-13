@@ -49,9 +49,27 @@ export const COMPONENTES_PADRAO = {
     rotulo: 'Backend de chamados (Node + Express + Prisma)',
     repo: 'C:/Users/Pablo/Desktop/chamados',
     branch: 'main',
-    // Suite real (vitest) e typecheck. Sem estes, a task do backend seria
+    // Três etapas de preparação, nesta ordem — e a ordem importa.
+    //
+    // `shared:build` primeiro: `shared/types` é um pacote COMPILADO e o
+    // backend lê o `dist/api.d.ts`. Um worktree novo não tem `dist` — só o repo
+    // base tem, espelhado por junction, com o contrato antigo. Sem esta etapa,
+    // qualquer task que mexa no contrato falha o typecheck com "has no exported
+    // member" para símbolos que existem no código: parece bug de código e é
+    // ambiente faltando.
+    //
+    // `prisma:generate` depois, e `preparar: true`: o client gerado do Prisma
+    // mora dentro de node_modules — que o orquestrador compartilha com o repo
+    // base por junction. Sem regenerar, o typecheck compara código novo contra
+    // tipos de schema antigo e acusa erro que não existe. O projeto já faz essa
+    // etapa no Dockerfile e no render.yaml; o gate só espelha o build de
+    // produção.
+    //
+    // Typecheck e suíte (vitest) por último: sem estes a task do backend seria
     // aceita sem nenhuma verificação automatizada.
     gates: [
+      { nome: 'shared:build', args: ['run', 'build'], obrigatorio: true, cwd: 'shared/types', preparar: true },
+      { nome: 'prisma:generate', args: ['run', 'prisma:generate'], obrigatorio: true, cwd: 'backend', preparar: true },
       { nome: 'typecheck', args: ['run', 'typecheck'], obrigatorio: true, cwd: 'backend' },
       { nome: 'test', args: ['test'], obrigatorio: true, cwd: 'backend' },
     ],
@@ -95,6 +113,13 @@ export const PADRAO = {
     worker: 'orq-worker',
     reviewer: 'orq-reviewer',
     integrator: 'orq-integrator',
+    /**
+     * Modelo do worker, no formato "provider/modelo" (ex.: "opencode/gemini-3.8-flash").
+     * Vazio = herda o padrão global da máquina. Fixar aqui é o que permite
+     * trocar de modelo quando um provedor começa a rejeitar uma requisição,
+     * sem mexer no código.
+     */
+    workerModel: '',
   },
   /** Timeout de uma task (ms). Tarefas grandes existem; 45min é o padrão. */
   taskTimeoutMs: 45 * 60 * 1000,

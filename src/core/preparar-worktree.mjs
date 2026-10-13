@@ -329,9 +329,15 @@ function listar(dir) {
 /**
  * Prepara o worktree inteiro para rodar os gates.
  *
+ * @param {object} opcoes
+ * @param {string[]} [opcoes.subdirs] Subdiretórios com gate, relativos à raiz.
+ *   Entra na lista mesmo quando o repo base não tem `node_modules` lá: é o
+ *   `cwd` declarado do gate, e um gate cujo cwd não tem dependência falha com
+ *   "tsc não é reconhecido", o que parece falha do código integrado.
+ *
  * @returns {{pacotes:object[], relinks:object[], builds:object[], problemas:string[]}}
  */
-export function prepararWorktree({ worktree, repoBase, log = () => {} }) {
+export function prepararWorktree({ worktree, repoBase, log = () => {}, subdirs = [] }) {
   const pacotes = []
   const relinks = []
   const builds = []
@@ -339,7 +345,13 @@ export function prepararWorktree({ worktree, repoBase, log = () => {} }) {
 
   // --- 1. node_modules por pacote, com as dependências locais apontando para
   //        dentro do worktree -----------------------------------------------
-  for (const dirBase of pacotesDoRepo(repoBase).comDependencias) {
+  const alvos = new Set(pacotesDoRepo(repoBase).comDependencias)
+  for (const sub of subdirs) {
+    const dir = join(repoBase, sub)
+    if (existsSync(join(dir, 'node_modules'))) alvos.add(dir)
+  }
+
+  for (const dirBase of alvos) {
     const rel = relative(repoBase, dirBase)
     const dirWt = rel ? join(worktree, rel) : worktree
 

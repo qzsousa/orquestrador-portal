@@ -42,8 +42,16 @@ function clienteFalso({ mensagens, diretorio }) {
   return { client: new OpencodeClient({ fetchImpl }), chamadas }
 }
 
-const CONCLUIDA = { info: { id: 'm1', role: 'assistant', time: { completed: 1700000000000 } }, parts: [] }
-const EM_ANDAMENTO = { info: { id: 'm1', role: 'assistant', time: {} }, parts: [] }
+/**
+ * Turno terminado / em andamento.
+ *
+ * `finish` é o campo que o OpenCode preenche quando o turno acaba — é nele que
+ * `esperarAgente` olha. O `time.completed` que existia numa versão anterior
+ * deste arquivo era detalhe da implementação antiga, e usar o campo errado aqui
+ * fazia o teste passar sem nunca exercitar a espera.
+ */
+const CONCLUIDA = { info: { id: 'm1', role: 'assistant', finish: 'stop', time: { completed: 1700000000000 } }, parts: [] }
+const EM_ANDAMENTO = { info: { id: 'm1', role: 'assistant', finish: '', time: {} }, parts: [] }
 
 describe('enviarPrompt — cancelamento', () => {
   test('chama /abort quando cancelado() vira verdadeiro', async () => {

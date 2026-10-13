@@ -13,6 +13,7 @@
  *   orq review <id>               revisão manual de uma task
  *   orq integrate [--aplicar]     integra aprovadas (para antes da main)
  *   orq recover                   reidrata o estado após reinício
+ *   orq adopt <id>                adota commits de agente que terminou sem o orquestrador
  *   orq clean <id> [--worktree]   descarta worktree/branch de uma task
  *   orq trello-sync               importa cards do Trello
  */
@@ -261,7 +262,7 @@ async function cmdStatus() {
 
 /* ---------------------------------------------------------------- review */
 
-async function cmdReview(pos, flags) {
+async function cmdReview(flags, pos) {
   const cfg = await carregarConfig()
   const store = storeDe(cfg)
 
@@ -309,10 +310,24 @@ async function cmdReview(pos, flags) {
       for (const a of r.avisos) log(`    ${p(C.yellow, '⚠')} ${a}`)
     }
 
-    const aprovado = r.aprovado && (crit.avaliados.length === 0 || crit.todosAtendidos)
+    // Critérios de aceitação são texto; gates são evidência. Reprovar por
+    // cobertura textual é reprovar por procurar palavra: aqui os três gates
+    // estavam verdes (a suíte inteira passando) e a task foi reprovada porque
+    // o critério "a suíte volta a npm test verde" não/share as palavras dos
+    // commits. Heurística de texto é aviso, nunca reprovação — a nota do
+    // próprio avaliarCriterios já dizia isso, e o código não cumpria.
+    const aprovado = r.aprovado
+    const criteriosEmAlerta = crit.avaliados.length > 0 && !crit.todosAtendidos
+
     log('')
     if (aprovado) {
-      log(p(C.green, `  ✓ APROVADA — ${tid} vai para aguardando-integracao`))
+      if (criteriosEmAlerta) {
+        log(p(C.yellow, `  ⚠ APROVADA com ressalva — ${tid}`))
+        log(p(C.dim, '    Evidência mecânica (gates) passou. Os critérios acima não têm cobertura textual.'))
+        log(p(C.dim, '    Confira na revisão se eles são de fato satisfeitos.'))
+      } else {
+        log(p(C.green, `  ✓ APROVADA — ${tid} vai para aguardando-integracao`))
+      }
       if (!flags['sem-aprovar']) {
         store.mudarEstado(tid, 'aguardando-integracao', { revisao: { ...r, criterios: crit, aprovadoEm: new Date().toISOString() } }, 'Revisão aprovada')
       }
@@ -454,6 +469,10 @@ async function cmdIntegrate(flags, pos) {
         log(p(C.bold, '\n  Aplicando na branch principal (--aplicar)...'))
         const aplicado = aplicarNaPrincipal({
           repo,
+          // O HEAD do worktree de integração: o RESULTADO. `baseSha` é de onde a
+          // integração partiu — usá-lo faz o fast-forward não mover nada e ainda
+          // reportar "main: X → X" como sucesso, que foi o que acontecia.
+          commitIntegracao: git.revParse('HEAD', rel.integracao.worktree),
           branchIntegracao: rel.branchIntegracao,
           baseSha: rel.integracao.baseSha,
           branchPrincipal: rel.integracao.branchPrincipal,
@@ -618,6 +637,120 @@ log(p(C.bold, `\nReanexando ${alvos.length} task(s)\n`))
   log('\nRode "orq status" e depois "orq review --todos".\n')
 }
 
+/* ----------------------------------------------------------------- adopt */
+
+/**
+ * Adota trabalho que o agente produziu mas que o orquestrador não chegou a
+ * registrar.
+ *
+ * O caso: `opencode serve` é solto, então ele continua executando o agente
+ * depois que o `orq run` morre (Ctrl+C, queda de conexão, queda da máquina). O
+ * agente termina e commita normalmente — e o orquestrador, que era quem deveria
+ * anotar isso, já não existe. Sem este comando, esse trabalho só aparecia como
+ * "task bloqueada" e a pessoa tinha adivinhar que o commit estava lá.
+ *
+ * Não inventa nada: lê os commits que realmente existem na branch e só avança
+ * a task se houver pelo menos um.
+ */
+async function cmdAdopt(flags, pos) {
+  const cfg = await carregarConfig()
+  const store = storeDe(cfg)
+
+  const id = pos[0]
+  if (!id) {
+    erro('Informe a task: orq adopt T-003')
+    process.exit(1)
+  }
+  const task = store.obter(id)
+  if (!task) {
+    erro(`Task ${id} não existe.`)
+    process.exit(1)
+  }
+  if (!task.worktree || !existsSync(task.worktree)) {
+    erro(`${id}: worktree não existe (${task.worktree || 'sem worktree'}). Nada para adotar.`)
+    process.exit(1)
+  }
+
+  const base = task.baseSha || git.revParse(task.baseRef || 'HEAD', task.worktree)
+  const commits = git.commitsDesde(task.worktree, base)
+
+  log(p(C.bold, `\n=== ${id} — adotando trabalho existente ===\n`))
+  log(`worktree: ${task.worktree}`)
+  log(`branch:   ${task.branch || '(sem branch)'}`)
+  log(`base:     ${base.slice(0, 7)}`)
+  log(`commits:  ${commits.length}`)
+
+  if (!commits.length) {
+    log('')
+    log(p(C.yellow, `  Nenhum commit desde a base.`))
+    log(p(C.dim, '  Esta task não produziu trabalho recuperável. Use "orq run" para executá-la.'))
+    return
+  }
+  for (const c of commits) log(p(C.dim, `  ${c.sha.slice(0, 7)} ${c.mensagem}`))
+
+  // Trabalho pela metade: o agente pode ter morrido antes de commitar.
+  let commitForcado = null
+  if (!git.arvoreLimpa(task.worktree)) {
+    const sujos = git.arquivosNaoCommitados(task.worktree)
+    if (flags['sem-commit']) {
+      log('')
+      log(p(C.yellow, `  ${sujos.length} arquivo(s) sem commit, mantidos como estão (--sem-commit).`))
+    } else {
+      const msg =
+        `feat(${id}): ${task.titulo}\n\nTask: ${id}\n` +
+        `Commitado pelo "orq adopt": o agente deixou trabalho sem commit.`
+      commitForcado = git.commitar(task.worktree, msg)
+      log('')
+      log(p(C.yellow, `  ${sujos.length} arquivo(s) sem commit → commit forçado (--sem-commit para não commitar).`))
+    }
+  }
+
+  const commitsFinal = git.commitsDesde(task.worktree, base)
+  const arquivos = git.arquivosCommitados(task.worktree, base)
+
+  // Recupera o resumo que o agente escreveu, se o servidor ainda estiver no ar.
+  let texto = task.resultado?.texto || ''
+  let resumoOrigem = 'estado anterior'
+  if (!texto && task.sessionID && !flags['sem-resumo']) {
+    try {
+      const client = new OpencodeClient(cfg.opencode)
+      texto = await client.ultimoTextoDoAgente(task.sessionID, task.worktree)
+      if (texto) resumoOrigem = `sessão ${task.sessionID}`
+    } catch (err) {
+      log(p(C.dim, `  (não foi possível ler a sessão: ${err.message})`))
+    }
+  }
+
+  const patch = {
+    commits: commitsFinal,
+    arquivosAlterados: arquivos,
+    erros: [],
+    resultado: {
+      resumo: primeiroBlocoTexto(texto, 'Resumo'),
+      texto,
+      adotada: true,
+      commitForcado: Boolean(commitForcado),
+      resumoOrigem,
+    },
+  }
+
+  store.mudarEstado(id, 'aguardando-revisao', patch, `Trabalho adotado (${commitsFinal.length} commit(s))`)
+
+  log('')
+  log(p(C.green, `  ✓ ${id} → aguardando-revisao`))
+  log(p(C.dim, `    resumo recuperado de: ${resumoOrigem}`))
+  log(p(C.dim, `    próxima etapa: orq review ${id}`))
+  log('')
+}
+
+/** Primeira seção markdown com o nome pedido; cai no texto inteiro. */
+function primeiroBlocoTexto(texto, secao) {
+  if (!texto) return ''
+  const re = new RegExp(`###\\s*${secao}\\s*\\n([\\s\\S]*?)(?=\\n###\\s|$)`, 'i')
+  const m = texto.match(re)
+  return m ? m[1].trim().slice(0, 2000) : texto.slice(0, 1000)
+}
+
 /* ------------------------------------------------------------------ clean */
 
 async function cmdClean(flags, pos) {
@@ -640,6 +773,10 @@ async function cmdClean(flags, pos) {
     return
   }
 
+  // Guardar o estado mas descartar o worktree é o caso do agente que morreu no
+  // meio: o runner recusa reexecutar enquanto o diretório existir, e apagar a
+  // task junto com ele jogaria fora o título, o escopo e os critérios — tudo
+  // que a pessoa escreveu à mão e que não se reconstrói sozinho.
   if (task.branch) {
     try {
       const repo = git.commonDir(task.worktree)
@@ -671,6 +808,16 @@ async function cmdClean(flags, pos) {
       rmSync(dirname(task.worktree), { recursive: true, force: true })
     } catch {}
   }
+
+  if (flags['manter']) {
+    store.atualizar(id, { branch: null, worktree: null, sessionID: null, baseSha: null, baseRef: null }, 'worktree-descartado', {
+      motivo: 'worktree e branch removidos; task mantida para reexecução',
+    })
+    store.mudarEstado(id, 'pronta', { erros: [] }, 'Pronta para reexecução (worktree descartado)')
+    log(p(C.green, `✓ ${id} mantida no estado e pronta para rodar de novo`))
+    return
+  }
+
   store.remover(id)
 }
 
@@ -743,6 +890,7 @@ const COMANDOS = {
   dep: cmdDep,
   recover: cmdRecover,
   resume: cmdResume,
+  adopt: cmdAdopt,
   clean: cmdClean,
   'trello-sync': cmdTrelloSync,
   'install-agents': cmdInstallAgents,
@@ -764,7 +912,8 @@ ${p(C.bold, 'Comandos:')}
   integrate          integra aprovadas  (--id X --aplicar)
   dep <id>           ajusta dependencia  (--add T-002 | --rm T-002)
   recover            reidrata estado após reinício
-  clean <id>         remove do estado  (--worktree também apaga branch)
+  adopt <id>         adota commits já feitos por um agente órfão
+  clean <id>         remove do estado  (--worktree também apaga branch; --manter preserva a task)
   trello-sync        importa cards  (--board ID --listas "A,B")
   install-agents     instala os agentes orq-*
 

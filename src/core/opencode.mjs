@@ -27,11 +27,17 @@ import { join } from 'node:path'
 
 const PORTA_PADRAO = 4653
 
+const dormir = (ms) => new Promise((r) => setTimeout(r, ms))
+
 export class OpencodeError extends Error {
-  constructor(mensagem, { status, body } = {}) {
+  constructor(mensagem, { status, body, causa } = {}) {
     super(mensagem)
     this.status = status
     this.body = body
+    // Código real por trás da queda (ECONNRESET, ECONNREFUSED, ...). Sem ele o
+    // diagnóstico para em "algo quebrou" e não dá para distinguir rede de
+    // processo morto.
+    this.causa = causa
   }
 }
 
@@ -109,10 +115,21 @@ export class OpencodeClient {
       if (ct.includes('application/json')) return res.json()
       return await res.text()
     } catch (err) {
+      if (err instanceof OpencodeError) throw err
       if (err.name === 'AbortError') {
         throw new OpencodeError(`${modo} ${caminho} excedeu ${timeoutMs}ms`, { status: 'timeout' })
       }
-      throw err
+      // O undici esconde o motivo real em .cause e ainda devolve um
+      // "TypeError: fetch failed" genérico. Sem desembrulhar, esse texto
+      // chegava ao estado da task como se fosse culpa do agente — e não era:
+      // era o orquestrador que tinha caído. O agente continuava rodando.
+      const causa = err?.cause
+      const codigo = causa?.code || err?.code || null
+      throw new OpencodeError(
+        `conexão com o servidor OpenCode caiu em ${modo} ${caminho}` +
+          (codigo ? ` (${codigo})` : ''),
+        { status: 'transporte', causa: codigo },
+      )
     } finally {
       clearTimeout(timer)
     }
@@ -139,79 +156,92 @@ export class OpencodeClient {
   }
 
 /**
- * Só ESPERA um turno já em andamento terminar. Não envia nada.
- *
- * Usado pela reanexão: quando o orquestrador morre no meio, o agente continua
- * working no servidor e o turno segue lá. Reanexar é voltar a olhar, não
- * mandar o briefing de novo.
- */
-async enviarPromptAguardar({ sessionID, timeoutMs = 1800000, intervaloMs = 3000, log = () => {}, cancelado }) {
-    const limite = Date.now() + timeoutMs
-    while (Date.now() < limite) {
-      if (cancelado?.()) {
-        throw new OpencodeError(`Turno abandonado: ${cancelado.motivo || 'a task mudou de estado'}`, { status: 'cancelado' })
-      }
-      const mensagens = await this.request('GET', `/session/${sessionID}/message`, { timeoutMs: 30000 })
-      const ultima = mensagens?.[mensagens.length - 1]
-      if (!ultima || ultima.info?.role !== 'assistant') {
-        await new Promise((r) => setTimeout(r, intervaloMs))
-        continue
-      }
-      if (ultima.info?.time?.completed) return ultima
-      log(`      ${ultima.info.id} ainda trabalhando (${ultima.parts?.length ?? 0} parts)`)
-      await new Promise((r) => setTimeout(r, intervaloMs))
-    }
-    throw new OpencodeError(`Agente não terminou em ${Math.round(timeoutMs / 1000)}s`, { status: 'timeout' })
-  }
-
-/**
- * Envia o briefing e espera o agente terminar.
- *
- * Não dá para usar o `POST /session/{id}/message` síncrono aqui. Ele segura a
- * conexão sem mandar nenhum byte até o agente acabar, e o `fetch` do Node mata
- * a requisição por `headersTimeout` — 300s por padrão no undici. Uma task de5
- * minutos morre com `fetch failed` mesmo com o `AbortController` do orq em
- * 45min: quem corta é a camada HTTP, não a nossa. Foi o que reprovou a primeira
- * rodada com as três tasks, todas no mesmo milissegundo.
- *
- * A saída é `prompt_async` (204, não bloqueia) + polling de `GET /messages`.
- * Cada requisição é curta, então o timeout de header nunca entra. O turno
- * acabou quando a última mensagem de assistant tem `time.completed` — enquanto
- * estiver vazio, o agente ainda está trabalhando.
- *
- * `agent` não vai no corpo: a sessão já foi criada com ele, e repetir o campo
- * faz o OpenCode resolver de novo a config do agente — o bloco `permissions`
- * do frontmatter entra no request ao provider, e quem não conhece esse
- * parâmetro responde 400 (`Unsupported parameter(s): 'permissions'`).
- *
- * `cancelado()` é consultado a cada volta do laço. Parar de ESPERAR não é o
- * bastante: o agente continua escrevendo no worktree do servidor, e a task pode
- * já estar bloqueada ou cancelada — resultado é trabalho num worktree que ninguém
- * vai revisar, commitado por um runner que achou que tinha parado. Quem detecta
- * a mudança de estado é o chamador; quem corta o turno é este `POST .../abort`.
- */
-async enviarPrompt({ sessionID, texto, timeoutMs = 1800000, intervaloMs = 3000, log = () => {}, cancelado }) {
+   * Envia o briefing e ESPERA o agente terminar.
+   *
+   * Não é um POST bloqueante, e essa distinção é o ponto. Um POST em
+   * `/message` que espera o agente inteiro morre por volta dos 5 minutos: o
+   * undici aborta por headers timeout (300s) muito antes de um agente de
+   * verdade terminar, e o orquestrador registra "conexão caiu" — enquanto o
+   * agente segue rodando no servidor e commita normalmente. Foi esse o defeito
+   * que fez a T-003 parecer task falha do agente quando estava pronta.
+   *
+   * O caminho da API para trabalho longo é `prompt_async`, que devolve 204 na
+   * hora. Depois é só esperar por polling, com requisições curtas que nunca
+   * batem em timeout de headers.
+   *
+   * `cancelado()` é consultado a cada volta do polling. Parar de ESPERAR não
+   * basta: o agente continua escrevendo no worktree do servidor, e a task pode
+   * já estar bloqueada ou cancelada — o resultado é trabalho num worktree que
+   * ninguém vai revisar, commitado por um runner que achava ter parado. Quem
+   * detecta a mudança de estado é o chamador; quem corta o turno é o
+   * `POST /abort` logo abaixo.
+   */
+  async enviarPrompt({ sessionID, texto, agent, timeoutMs = 1800000, directory, intervaloMs = 3000, log = () => {}, cancelado }) {
     await this.request('POST', `/session/${sessionID}/prompt_async`, {
-      body: { parts: [{ type: 'text', text: texto }] },
+      query: { directory },
+      body: { parts: [{ type: 'text', text: texto }], agent },
       timeoutMs: 60000,
     })
+    return this.esperarAgente({ sessionID, directory, timeoutMs, intervaloMs, log, cancelado, abortarAoCancelar: true })
+  }
 
+  /**
+   * Só ESPERA um turno já em andamento terminar. Não envia nada.
+   *
+   * Usado pela reanexão (`orq resume`): quando o orquestrador morre no meio, o
+   * agente continua working no servidor e o turno segue lá. Reanexar é voltar a
+   * olhar, não mandar o briefing de novo.
+   *
+   * Aqui o cancelamento NÃO aborta a sessão: o turno é de outra execução e
+   * pode ser aproveitado, e matar a sessão jogaria fora o que ela já produziu.
+   * Por isso `abortarAoCancelar` fica falso.
+   */
+  async enviarPromptAguardar({ sessionID, timeoutMs = 1800000, directory, intervaloMs = 3000, log = () => {}, cancelado }) {
+    return this.esperarAgente({ sessionID, directory, timeoutMs, intervaloMs, log, cancelado })
+  }
+
+  /**
+   * Aguarda o agente terminar, por polling das mensagens.
+   *
+   * Terminado = a última mensagem de assistant ganhou um `finish` (ou um
+   * `error`). Enquanto ela está em andamento, `finish` vem vazio.
+   *
+   * Um erro de rede no meio do polling não aborta a espera: um agente pode
+   * levar 40 minutos e não é razoável perder o trabalho por um pico de 2
+   * segundos. Só desiste depois de várias falhas seguidas.
+   */
+  async esperarAgente({ sessionID, directory, timeoutMs = 1800000, intervaloMs = 3000, maxFalhasConsecutivas = 5, log = () => {}, cancelado, abortarAoCancelar = false }) {
     const limite = Date.now() + timeoutMs
+    let falhasConsecutivas = 0
+
     while (Date.now() < limite) {
+      // O cancelamento é consultado ANTES de qualquer requisição: o turno ainda
+      // está rodando no servidor, e um GET de mensagens seria um ciclo de rede
+      // inteiro desperdiçado num turno que já foi abandonado.
       if (cancelado?.()) {
-        // Abortar ANTES de consultar mensagens: o turno ainda está rodando no
-        // servidor, e ele que precisa ser cortado.
-        await this.abortar(sessionID)
-        throw new OpencodeError(`Turno abortado: ${cancelado.motivo || 'a task mudou de estado'}`, { status: 'cancelado' })
+        const motivo = cancelado.motivo || 'a task mudou de estado'
+        if (abortarAoCancelar) await this.abortar(sessionID)
+        throw new OpencodeError(`turno abortado: ${motivo}`, { status: 'cancelado' })
       }
-      await new Promise((r) => setTimeout(r, intervaloMs))
-      const mensagens = await this.request('GET', `/session/${sessionID}/message`, { timeoutMs: 30000 })
-      const ultima = mensagens?.[mensagens.length - 1]
-      if (!ultima || ultima.info?.role !== 'assistant') continue
-      if (ultima.info?.time?.completed) return ultima
-      log(`      ${ultima.info.id} ainda trabalhando (${ultima.parts?.length ?? 0} parts)`)
+      try {
+        const msgs = await this.mensagens(sessionID, directory)
+        const lista = Array.isArray(msgs) ? msgs : []
+        falhasConsecutivas = 0
+        for (let i = lista.length - 1; i >= 0; i--) {
+          const info = lista[i]?.info
+          if (info?.role !== 'assistant') continue
+          if (info.error || info.finish) return lista[i]
+          log(`      ${info.id} ainda trabalhando`)
+          break
+        }
+      } catch (err) {
+        if (err.status === 'cancelado') throw err
+        falhasConsecutivas++
+        if (falhasConsecutivas >= maxFalhasConsecutivas) throw err
+      }
+      await dormir(intervaloMs)
     }
-    throw new OpencodeError(`Agente não terminou em ${Math.round(timeoutMs / 1000)}s`, { status: 'timeout' })
+throw new OpencodeError(`agente não terminou em ${Math.round(timeoutMs / 1000)}s`, { status: 'timeout' })
   }
 
   abortar(sessionID) {
@@ -234,6 +264,35 @@ async enviarPrompt({ sessionID, texto, timeoutMs = 1800000, intervaloMs = 3000, 
 
   sessao(sessionID) {
     return this.request('GET', `/session/${sessionID}`, { timeoutMs: 15000 })
+  }
+
+  /**
+   * Histórico de mensagens da sessão.
+   *
+   * É o que torna a recuperação possível: a sessão vive dentro do `opencode
+   * serve`, que é solto. Quando o `orq run` morre no meio, a sessão continua
+   * existindo no servidor com tudo o que o agente produziu — inclusive o
+   * resumo final. Sem este método, esse texto ficava inalcançável.
+   */
+  mensagens(sessionID, directory) {
+    return this.request('GET', `/session/${sessionID}/message`, {
+      query: { directory },
+      timeoutMs: 30000,
+    })
+  }
+
+  /** Último texto que o agente escreveu, ou '' se não houver. */
+  async ultimoTextoDoAgente(sessionID, directory) {
+    const msgs = await this.mensagens(sessionID, directory)
+    const lista = Array.isArray(msgs) ? msgs : []
+    for (let i = lista.length - 1; i >= 0; i--) {
+      if (lista[i]?.info?.role !== 'assistant') continue
+      const textos = (lista[i].parts || [])
+        .filter((x) => x.type === 'text' && x.text?.trim())
+        .map((x) => x.text)
+      if (textos.length) return textos.join('\n\n')
+    }
+    return ''
   }
 
   responderPermissao(sessionID, requestID, resposta) {
@@ -440,8 +499,21 @@ export function extrairTexto(resposta) {
 
 /** Parts que registraram erro — sinal de task que vai falhar. */
 export function extrairErros(resposta) {
-  const parts = resposta?.parts || []
   const erros = []
+
+  // Falha no nível da mensagem, não de uma part. Ocorre quando o agente nem
+  // chegou a produzir ferramenta nenhuma: provedor devolvendo HTTP 400,
+  // autenticação, modelo inexistente. Sem olhar aqui, `extrairErros` devolvia
+  // lista vazia e o orquestrador concluía "a task não alterou nada" — que é
+  // falso. O agente não falhou em codar; ele nunca chegou a rodar.
+  const erroMsg = resposta?.info?.error
+  if (erroMsg) {
+    const d = erroMsg.data || erroMsg
+    const status = d.statusCode ? ` (HTTP ${d.statusCode})` : ''
+    erros.push(`agente: ${erroMsg.name || 'erro'}${status}: ${d.message || d}`)
+  }
+
+  const parts = resposta?.parts || []
   for (const p of parts) {
     if (p?.state?.status === 'error' && p.state.error) {
       erros.push(String(p.state.error?.data?.message || p.state.error?.name || p.state.error))
