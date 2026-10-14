@@ -94,3 +94,13 @@ O que ficou fora, o que pode quebrar, de que task isso depende.
 Se você não conseguiu cumprir um critério, **diga**. Uma task que reporta falha
 parcial é útil; uma que reporta sucesso sem ter feito vai ser integrada e
 vira defeito.
+## Lembrete de skills (OpenCode)
+
+Antes de editar ou revisar, carregue via tool `skill` a skill adequada ao escopo:
+- frontend/React/Vite/UI: `frontend-design`, `frontend-patterns`, `frontend-ui-ux`, `webapp-testing`, `lsp-validation`
+- backend Node/Express/Prisma/Postgres: `backend-patterns`, `postgres-patterns`, `security-review`, `coding-standards`, `tdd-workflow`
+- Spring/Java: `springboot-patterns`, `springboot-security`, `springboot-tdd`, `springboot-verification`, `java-coding-standards`, `jpa-patterns`
+- Qualidade/gates: `verification-loop`, `eval-harness`, `strategic-compact`
+- Aprendizado/contexto: `continuous-learning`, `continuous-learning-v2`, `iterative-retrieval`
+
+Se mais de uma se aplica, carregue em paralelo. Siga a checklist da skill em vez de improvisar.

@@ -76,3 +76,35 @@ existe" e parecem bug de código.
 
 `.state/` e `logs/` estão no `.gitignore` e não devem ser versionados. Os
 worktrees também: são clones de trabalho, não fonte.
+
+## Skills disponiveis para agentes (OpenCode)
+
+As skills instaladas em `~/.config/opencode/skills` e `~/.config/opencode/skill`
+sao descobertas pelo OpenCode e aparecem em `available_skills`. Antes de
+trabalhar, cada agente (worker/reviewer/integrator) deve carregar via tool
+`skill` a skill relevante ao escopo da tarefa e seguir suas instrucoes.
+
+Skills relevantes por frente:
+- Portal/frontend (React/Vite): `frontend-design`, `frontend-patterns`,
+  `frontend-ui-ux`, `webapp-testing`, `lsp-validation`
+- Backend (Node/Express/Prisma/Postgres): `backend-patterns`, `postgres-patterns`,
+  `security-review`, `coding-standards`, `tdd-workflow`
+- Chamados/SCE (Spring/Java): `springboot-patterns`, `springboot-security`,
+  `springboot-tdd`, `springboot-verification`, `java-coding-standards`,
+  `jpa-patterns`
+- Qualidade/gates: `verification-loop`, `eval-harness`, `strategic-compact`
+- Aprendizado/contexto: `continuous-learning`, `continuous-learning-v2`,
+  `iterative-retrieval`
+
+Lista completa das skills instaladas: `backend-patterns`, `clickhouse-io`,
+`coding-standards`, `continuous-learning`, `continuous-learning-v2`,
+`eval-harness`, `frontend-design`, `frontend-patterns`, `frontend-ui-ux`,
+`golang-patterns`, `golang-testing`, `iterative-retrieval`,
+`java-coding-standards`, `jpa-patterns`, `lsp-validation`,
+`postgres-patterns`, `project-guidelines-example`, `security-review`,
+`springboot-patterns`, `springboot-security`, `springboot-tdd`,
+`springboot-verification`, `strategic-compact`, `tdd-workflow`,
+`verification-loop`, `webapp-testing` (tambem built-in: `opencode`, `report`).
+
+Regra: se mais de uma skill se aplica, carrega-las em paralelo; se nenhuma
+se aplicar claramente, comece por `coding-standards`.
