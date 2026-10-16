@@ -246,6 +246,15 @@ export function docsRelevantes(cfg, task) {
     }
   }
   // Sempre a visão geral e a estrutura: são o mínimo para não se perder.
-  capitulos.add('01-visao-geral')
+  // Sempre a vis�o geral e a estrutura: s�o o m�nimo para n�o se perder.
+  //
+  // Mas s� para o componente que declara `docs`. A pasta n�o existe em todo
+  // repo: o backend de chamados n�o tem `docs/`, e mesmo assim o briefing
+  // mandava o agente ler `docs/01-visao-geral.md` do mesmo jeito. O agente que
+  // obedecia morria com "File not found" e a task bloqueava por um arquivo que
+  // ninguem pediu.
+  for (const c of comps) {
+    if (cfg.componentes[c]?.docs) capitulos.add('01-visao-geral')
+  }
   return [...capitulos].sort()
 }

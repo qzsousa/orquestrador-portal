@@ -525,6 +525,7 @@ export async function reanexarTask({ cfg, store, task, client, log = () => {} })
     log(`[${task.id}] FALHOU na reanexão: ${err.message}`)
     return registro
   }
+}
 
 /**
  * Modelo da sessao, em qualquer uma das duas formas aceitas.
@@ -536,12 +537,6 @@ export async function reanexarTask({ cfg, store, task, client, log = () => {} })
  * a traducao acontece aqui e nao no servidor.
  */
 function modeloDe(valor) {
-  if (!valor) return undefined
-  if (typeof valor === 'object') return valor
-  const i = String(valor).indexOf('/')
-  if (i < 1) return undefined
-  return { providerID: String(valor).slice(0, i), id: String(valor).slice(i + 1) }
-}
   if (!valor) return undefined
   if (typeof valor === 'object') return valor
   const i = String(valor).indexOf('/')

@@ -153,6 +153,15 @@ export function rotuloDoGate(g) {
  * truncados. O texto vai para o relatório porque "build passou" sem evidência
  * não é verificável por ninguém depois.
  */
+function alvoNpm() {
+  // No Windows o npm so existe como `.cmd` (bat do scoop, ou `npm.cmd` da
+  // instalação de Node), e rodar via spawnSync shell:true é o único caminho
+  // que resolve bem. Use a variável de ambiente PATH ou o binário mais próximo.
+  const binDir = dirname(process.execPath)
+  const npmCmd = join(binDir, 'npm.cmd')
+  return { comando: 'cmd.exe', prefixo: ['/c', npmCmd] }
+}
+
 export function rodarGate({ gate, cwd, timeoutMs = 15 * 60 * 1000, env = {} }) {
   const args = argsDoGate(gate)
   const { comando, prefixo } = alvoNpm()
