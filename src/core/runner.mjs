@@ -18,7 +18,50 @@ import { join } from 'node:path'
 import * as git from './git.mjs'
 import { extrairTexto, extrairErros, extrairFerramentas } from './opencode.mjs'
 import { prepararAmbiente, subdiretoriosDeGate } from './review.mjs'
-import { repoDoComponente, componentesDaTask, docsRelevantes, modeloDoComponente } from './config.mjs'
+import { repoDoComponente, componentesDaTask, docsRelevantes, escolherModelo } from './config.mjs'
+import { calcularDificuldade, descreverDificuldade } from './difficulty.mjs'
+
+/**
+ * Skills que o briefing recomenda, por componente e por assunto da task.
+ *
+ * Por que o orq decide isso e nao deixa o agente escolher sozinho: os agentes
+ * listam skills de forma generica ("carregue a adequada"), e o resultado e o
+ * agente escolher a primeira. Aqui a escolha sai do escopo declarado da task --
+ * o mesmo dado que ja determina o repo do worktree e o gate -- entao a
+ * recomendacao e reproduzivel e aparece no log.
+ *
+ * A lista NAO e normativa: o agente pode carregar outra, e o briefing diz isso.
+ * Recomendar e reduzir duvida, nao criar dependencia de um nome exato.
+ */
+const SKILLS_POR_COMPONENTE = {
+  portal: ['frontend-design', 'frontend-patterns', 'frontend-ui-ux'],
+  monitor: ['backend-patterns', 'coding-standards', 'tdd-workflow'],
+  chamados: ['backend-patterns', 'coding-standards', 'security-review'],
+  sce: ['backend-patterns', 'coding-standards', 'security-review'],
+}
+
+/** Skills que dependem do que a TASK faz, nao de onde ela mora. */
+const SKILLS_POR_ASSUNTO = [
+  { re: /prisma|schema|migra|modelo prisma|tabela/i, skill: 'postgres-patterns' },
+  { re: /\bteste?s?\b|tdd|spec|cobertura|vitest/i, skill: 'tdd-workflow' },
+  { re: /tipagem|\btypes?\b|vue-tsc|typecheck|lint/i, skill: 'lsp-validation' },
+  { re: /navegador|e2e|playwright|selenium|\bui\b|tela/i, skill: 'webapp-testing' },
+  { re: /refator|limp|simpl|organiz|dedup/i, skill: 'strategic-compact' },
+  { re: /erro|falha|corrig|bug|regress/i, skill: 'verification-loop' },
+  { re: /contrato|endpoint|integr|impacto|outro lado/i, skill: 'eval-harness' },
+  { re: /seguran|permiss|autentica|sanitiz|token/i, skill: 'security-review' },
+]
+
+export function skillsSugeridas(task, comps) {
+  const texto = [task.titulo || '', task.descricao || '', ...(task.criterios || [])].join(' ').toLowerCase()
+  const set = new Set()
+  for (const c of comps || []) for (const s of SKILLS_POR_COMPONENTE[c] || []) set.add(s)
+  for (const { re, skill } of SKILLS_POR_ASSUNTO) if (re.test(texto)) set.add(skill)
+  // `coding-standards` e o piso: cobre qualquer repositorio, mesmo os que
+  // nao estao no registro de componentes.
+  set.add('coding-standards')
+  return [...set].sort()
+}
 
 /**
  * Monta o briefing do agente.
@@ -27,9 +70,36 @@ import { repoDoComponente, componentesDaTask, docsRelevantes, modeloDoComponente
  * trabalhar sem precisar ler o projeto inteiro. Docs relevantes são citados por
  * capítulo; o resto do projeto é sob demanda.
  */
-export function montarBriefing({ cfg, task, worktree, branch, baseSha, docs = [] }) {
+export function montarBriefing({ cfg, task, worktree, branch, baseSha, docs = [], dificuldade }) {
   const comps = componentesDaTask(cfg, task)
   const rotulosComponentes = comps.map((c) => `${c} (${cfg.componentes[c]?.rotulo || c})`).join(', ')
+
+  const skills = skillsSugeridas(task, comps)
+  const blocoSkills = skills.length
+    ? [
+        '## Skills recomendadas para esta task',
+        'Carregue via ferramenta `skill` antes de editar. Cada uma traz uma checklist; siga a checklist em vez de improvisar.',
+        ...skills.map((s) => `- ${s}`),
+        '',
+        'Esta lista é uma recomendação do orquestrador, derivada do componente e do assunto da task — não é uma lista fechada. Se uma skill fora daqui for obviamente a certa, carregue também.',
+        '',
+        '',
+      ].join('\n')
+    : ''
+
+  const blocoDificuldade = dificuldade
+    ? [
+        '## Dificuldade estimada desta task',
+        `- Nível: **${dificuldade.nivel}** (score ${dificuldade.score})`,
+        `- Por quê: ${dificuldade.motivos.join(', ')}`,
+        '',
+        dificuldade.nivel === 'dificil'
+          ? 'Nível difícil: confirme a leitura do código ANTES de editar, e rode o gate cedo para separar erro seu de erro que já existia.'
+          : 'Não complique: faça a menor mudança que atende os critérios e siga para o gate.',
+        '',
+        '',
+      ].join('\n')
+    : ''
 
   const criterios = (task.criterios || []).length
     ? task.criterios.map((c, i) => `  ${i + 1}. ${c}`).join('\n')
@@ -82,7 +152,7 @@ Este worktree foi criado a partir da branch principal no commit acima. Não volt
 ## Task ${task.id}
 ${task.descricao || task.titulo}
 
-## Critérios de aceitação
+${blocoDificuldade}${blocoSkills}## Critérios de aceitação
 ${criterios}
 
 ## Escopo de arquivos
@@ -201,7 +271,17 @@ export async function executarTask({ cfg, store, task, client, log = () => {} })
     })
 
     // --- 2. Sessão amarrada ao worktree ---------------------------------
+    //
+    // A dificuldade é calculada AQUI, antes da sessão, e não é um detalhe
+    // cosmético: ela escolhe o modelo e vai para o briefing. Precisa ser a
+    // mesma nos dois lugares, e o único jeito de garantir isso é calcular uma
+    // vez e passar adiante.
+    const dificuldade = calcularDificuldade(task)
+    registro.dificuldade = dificuldade
+    log(`[${task.id}] dificuldade: ${descreverDificuldade(dificuldade)}`)
+
     const docs = docsRelevantes(cfg, task)
+    const modelo = escolherModelo(cfg, componentePrincipal, dificuldade)
     const sessao = await client.criarSessao({
       directory: worktree,
       agent: cfg.agentes.worker,
@@ -211,21 +291,40 @@ export async function executarTask({ cfg, store, task, client, log = () => {} })
       // motivo e o relatório não diz qual. Fixar aqui deixa a falha visível e
       // troca de modelo é uma linha de config, não de código.
       //
-      // O modelo do COMPONENTE tem precedência sobre o global do agente: é o
-      // que permite fixar um modelo só num componente que precisa, sem repetir
-      // o resto. `modeloDoComponente` já devolve null quando não há nada
-      // configurado, e `modeloDe(null)` devolve undefined — os dois aceitam as
-      // duas formas ("provider/modelo" e o objeto), então nenhum lado quebra.
-      model: modeloDe(modeloDoComponente(cfg, componentePrincipal) ?? cfg.agentes.workerModel),
+      // `escolherModelo` já resolve a precedência completa (componente +
+      // dificuldade → componente → worker → global) e devolve `null` quando
+      // nada está configurado; `modeloDe(null)` devolve undefined, que o POST
+      // /session aceita como "sem modelo". Os dois lados aceitam a string
+      // "provider/modelo" e o objeto `{ providerID, id }`.
+      model: modeloDe(modelo),
       title: `orq ${task.id}: ${task.titulo}`,
-      metadata: { orqTaskId: task.id, componente: componentePrincipal },
+      // A dificuldade e o modelo entram no metadata da sessão porque é o
+      // único lugar que sobrevive a task: quando alguém abre a sessão no TUI
+      // três semanas depois, "por que essa task rodou com esse modelo" tem
+      // que ter resposta sem depender de memória.
+      metadata: {
+        orqTaskId: task.id,
+        componente: componentePrincipal,
+        dificuldade: dificuldade.nivel,
+        diffScore: dificuldade.score,
+        modelo: typeof modelo === 'string' ? modelo : null,
+      },
     })
     if (!sessao?.id) throw new Error('OpenCode não devolveu sessionID ao criar a sessão')
-    store.atualizar(task.id, { sessionID: sessao.id, agente: cfg.agentes.worker }, 'sessao-criada', {
-      sessionID: sessao.id,
-    })
-    log(`[${task.id}] sessão: ${sessao.id}`)
-    registro.etapas.push({ etapa: 'sessao', ok: true, sessionID: sessao.id })
+    store.atualizar(
+      task.id,
+      {
+        sessionID: sessao.id,
+        agente: cfg.agentes.worker,
+        dificuldade: dificuldade.nivel,
+        diffScore: dificuldade.score,
+        modelo: typeof modelo === 'string' ? modelo : null,
+      },
+      'sessao-criada',
+      { sessionID: sessao.id, dificuldade: dificuldade.nivel, modelo },
+    )
+    log(`[${task.id}] sessão: ${sessao.id}${modelo ? ` (modelo: ${typeof modelo === 'string' ? modelo : 'objeto'})` : ' (modelo: default do servidor)'}`)
+    registro.etapas.push({ etapa: 'sessao', ok: true, sessionID: sessao.id, modelo: modelo ?? null })
 
     // --- 3. Briefing + execução ------------------------------------------
     const briefing = montarBriefing({
@@ -235,6 +334,7 @@ export async function executarTask({ cfg, store, task, client, log = () => {} })
       branch,
       baseSha: wt.baseSha,
       docs,
+      dificuldade,
     })
 
 // O agente precisa PARAR aqui — nos dois sentidos.
@@ -525,23 +625,24 @@ export async function reanexarTask({ cfg, store, task, client, log = () => {} })
     log(`[${task.id}] FALHOU na reanexão: ${err.message}`)
     return registro
   }
+}
 
 /**
- * Modelo da sessao, em qualquer uma das duas formas aceitas.
+ * Modelo da sessão, em qualquer uma das duas formas aceitas.
  *
  * "provider/modelo" -> { providerID, id }.
  *
  * O POST /session exige esse objeto e rejeita string solta com 400 — o schema
  * e `additionalProperties: false` com `id` e `providerID` obrigatorios. Por isso
  * a traducao acontece aqui e nao no servidor.
+ *
+ * Exportada para ter teste proprio: ela ja ficou aninhada dentro de
+ * `reanexarTask` por causa de uma chave de fechamento faltando, e o sintoma foi
+ * `ReferenceError: modeloDe is not defined` — que passa em `node --check`
+ * (o arquivo continua sintaticamente valido) e so quebra em runtime, no meio
+ * de uma task que ja custou um worktree inteiro.
  */
-function modeloDe(valor) {
-  if (!valor) return undefined
-  if (typeof valor === 'object') return valor
-  const i = String(valor).indexOf('/')
-  if (i < 1) return undefined
-  return { providerID: String(valor).slice(0, i), id: String(valor).slice(i + 1) }
-}
+export function modeloDe(valor) {
   if (!valor) return undefined
   if (typeof valor === 'object') return valor
   const i = String(valor).indexOf('/')

@@ -11,7 +11,7 @@
  * para o node_modules do repo base — sem copiar (barato) e sem instalar de novo.
  */
 
-import { spawnSync } from 'node:child_process'
+import { spawnSync, execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, readdirSync, rmSync, symlinkSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import * as git from './git.mjs'
@@ -146,6 +146,56 @@ function argsDoGate(g) {
 /** Nome legível do gate, para relatório e erro. */
 export function rotuloDoGate(g) {
   return g.label || (Array.isArray(g.args) ? `npm ${g.args.join(' ')}` : `npm ${g.cmd}`)
+}
+
+/**
+ * Como executar o npm sem shell.
+ *
+ * `rodarGate` usa `shell: false` de propósito — título de gate pode vir de
+ * config escrita à mão, e shell transforma argumento em comando. No Windows
+ * isso colide com o npm: `npm` no PATH é `npm.cmd`, um batch, e CreateProcess
+ * não executa batch. O sintoma é ENOENT num gate que "deveria" funcionar, e a
+ * tentação natural é virar para `shell: true` — que é exatamente o que o resto
+ * do orquestrador evita.
+ *
+ * A saída é rodar o `npm-cli.js` com o próprio node: `{ comando: node,
+ * prefixo: [npm-cli.js] }`. É o mesmo truque de `comandoOpencode` em
+ * opencode.mjs, e por isso as duas funções existem.
+ *
+ * `exportada` porque gate é a prova de que a mudança funciona: se isto
+ * quebrar, o orchestrator aprova task sem nunca ter rodado o build.
+ */
+export function alvoNpm() {
+  if (process.platform !== 'win32') return { comando: 'npm', prefixo: [] }
+  try {
+    const candidatos = execFileSync('where', ['npm'], { encoding: 'utf8', windowsHide: true })
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter(Boolean)
+    // `npm.cmd` é um shim que chama npm-cli.js. Achando o cli, o node roda
+    // direto e o problema de batch some.
+    const cmd = candidatos.find((c) => c.toLowerCase().endsWith('.cmd'))
+    if (cmd) {
+      const raiz = cmd.replace(/\\npm\.cmd$/i, '')
+      for (const rel of [
+        '\\node_modules\\npm\\bin\\npm-cli.js',
+        '/node_modules/npm/bin/npm-cli.js',
+      ]) {
+        const cli = raiz + rel
+        if (existsSync(cli)) return { comando: process.execPath, prefixo: [cli] }
+      }
+    }
+    // Shim do próprio node install: C:\Program Files\nodejs\node_modules\npm\bin
+    const exe = candidatos.find((c) => c.toLowerCase().endsWith('node.exe'))
+    if (exe) {
+      const base = exe.replace(/\\node\.exe$/i, '')
+      for (const rel of ['\\node_modules\\npm\\bin\\npm-cli.js', '/node_modules/npm/bin/npm-cli.js']) {
+        const cli = base + rel
+        if (existsSync(cli)) return { comando: process.execPath, prefixo: [cli] }
+      }
+    }
+  } catch {}
+  return { comando: 'npm', prefixo: [] }
 }
 
 /**

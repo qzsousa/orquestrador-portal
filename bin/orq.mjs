@@ -21,7 +21,8 @@
 import { existsSync, readdirSync, rmSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { TaskStore } from '../src/core/taskstore.mjs'
-import { carregarConfig, repoDoComponente, componentesDaTask } from '../src/core/config.mjs'
+import { carregarConfig, repoDoComponente, componentesDaTask, tabelaDeModelos, avisosDeModelo, catalogoDeModelos, mcpAtivos, escolherModelo } from '../src/core/config.mjs'
+import { calcularDificuldade } from '../src/core/difficulty.mjs'
 import { OpencodeClient, OpencodeServer } from '../src/core/opencode.mjs'
 import { executarTask, reanexarTask } from '../src/core/runner.mjs'
 import { revisar, avaliarCriterios, limparAmbiente } from '../src/core/review.mjs'
@@ -98,10 +99,65 @@ async function cmdInit() {
   const noAr = await client.health().then(() => true).catch(() => false)
   log(`  porta ${cfg.opencode.port}: ${noAr ? p(C.green, 'respondendo') : p(C.yellow, 'não está no ar (será iniciado no orq run)')}`)
 
-  log(`\n${p(C.bold, 'Agentes:')}`)
-  for (const [papel, nome] of Object.entries(cfg.agentes)) {
-    log(`  ${papel.padEnd(10)} ${nome}${existsSync(join(cfg.raiz, 'agents', `${nome}.md`)) ? '' : p(C.yellow, '  ← não instalado (rode: orq install-agents)')}`)
+log(`\n${p(C.bold, 'Agentes:')}`)
+  // Só os papéis: `cfg.agentes` também guarda `workerModel`, que não é um
+  // agente. Iterar o objeto inteiro listava um agente chamado `workerModel`
+  // com o aviso de "não instalado" - ruído que escondia os três reais.
+  //
+  // O caminho conferido é o GLOBAL (~/.config/opencode/agent), não
+  // `agents/` no repo. Conferir o repo dá "tudo instalado" numa máquina em que
+  // o servidor não acha nenhum deles: a sessão é criada, o prompt_async morre
+  // com UnknownError e o agente não dá sinal de vida até o tempo acabar. O
+  // repo é a fonte; o que o servidor lê é o destino.
+  const dirAgentes = join(process.env.USERPROFILE || process.env.HOME, '.config', 'opencode', 'agent')
+  for (const papel of ['worker', 'reviewer', 'integrator']) {
+    const nome = cfg.agentes?.[papel]
+    if (!nome) continue
+    const instalado = existsSync(join(dirAgentes, `${nome}.md`))
+    const noRepo = existsSync(join(cfg.raiz, 'agents', `${nome}.md`))
+    const dica = instalado ? '' : noRepo ? 'no repo, mas NÃO instalado (rode: orq install-agents)' : 'ausente no repo também'
+    log(`  ${papel.padEnd(10)} ${nome}${instalado ? '' : p(C.yellow, `  ⚠ ${dica}`)}`)
   }
+
+  // A rota de modelo fica no init, e nao num `orq models`: enquanto ela nao
+  // esta visivel, a unica forma de descobrir por que a T-012 rodou com um
+  // modelo e outro e abrir sessao antiga. Aqui ela aparece antes de gastar
+  // tempo de agente.
+  log(`\n${p(C.bold, 'Roteamento de modelo (por dificuldade):')}`)
+  // A largura da coluna vem dos próprios nomes, não de um número chutado. Com
+  // nome de 36 caracteres numa coluna de 34, a tabela vira uma linha só — e
+  // "modelo errado" fica invisível justamente na linha que existe para
+  // mostrar o modelo.
+  const tabela = tabelaDeModelos(cfg)
+  const nomes = tabela.flatMap((l) => Object.values(l.porNivel).filter(Boolean).map(String))
+  const L = Math.max(12, ...nomes.map((n) => n.length)) + 2
+  log(p(C.dim, `  ${'componente'.padEnd(11)} ${'facil'.padEnd(L)} ${'medio'.padEnd(L)} ${'dificil'}`))
+  for (const linha of tabela) {
+    const celula = (n) => (linha.porNivel[n] ? String(linha.porNivel[n]) : p(C.dim, 'default')).padEnd(L)
+    log(`  ${linha.componente.padEnd(11)} ${celula('facil')}${celula('medio')}${linha.porNivel.dificil || p(C.dim, 'default')}`)
+  }
+  // O catalogo vem do servidor, e nao de uma lista escrita a mao: um id que o
+  // provider nao tem nao derruba o `serve`, ele so faz a sessao nunca produzir
+  // mensagem. E o aviso tem que vir de quem sabe.
+  const catalogo = await catalogoDeModelos(cfg)
+  if (catalogo.length) log(p(C.dim, `  (catálogo do servidor: ${catalogo.length} modelos em ${new Set(catalogo.map((m) => m.split('/')[0])).size} provider(s))`))
+  const avisos = avisosDeModelo(cfg, catalogo)
+  if (avisos.length) {
+    log(`\n${p(C.yellow, '  Aviso:')} modelo fora do catálogo:`)
+    for (const a of avisos) log(`    ${a}`)
+    log(p(C.dim, '    Um id inválido não derruba o servidor: a sessão é criada e nunca responde, e a task fica em-andamento para sempre.'))
+    log(p(C.dim, '    Veja os ids reais com: orq init (com o servidor no ar) ou em /config/providers.'))
+  }
+
+  const mcp = mcpAtivos(cfg)
+  log(`\n${p(C.bold, 'MCPs:')} ${mcp.length ? p(C.green, mcp.length + ' habilitado(s)') : p(C.yellow, 'nenhum habilitado')}`)
+  // Sem os flags de -y e o nome do pacote: o resto é o que o MCP recebe, e é isso
+  // que a pessoa quer conferir.
+  for (const { nome, def } of mcp) {
+    const alvo = def.command.filter((a) => !String(a).startsWith('-') && !String(a).includes('@')).join(' ')
+    log(`  ${nome.padEnd(20)} ${alvo || '(sem argumento)'}`)
+  }
+  log(p(C.dim, '  "orq sync-mcp" escreve em ~/.config/opencode/opencode.jsonc (o servidor lê no próximo boot).'))
 
   log(`\n${ok ? p(C.green, 'Ambiente OK.') : p(C.yellow, 'Atenção: ajuste os pontos acima.')}`)
 }
@@ -213,12 +269,19 @@ async function cmdPlan(flags) {
   for (const t of ordem) {
     const m = motivoBloqueio(t, store.ativas())
     const cor = t.risco === 'alto' ? C.red : t.risco === 'baixo' ? C.dim : C.yellow
+    // Dificuldade e modelo entram aqui porque este e o ultimo lugar onde a
+    // pessoa decide se vale despachar. Descobrir depois que a task rodou no
+    // modelo errado nao tem reparo curto.
+    const diff = calcularDificuldade(t)
+    const modelo = escolherModelo(cfg, componentesDaTask(cfg, t)[0], diff)
+    const corDiff = diff.nivel === 'dificil' ? C.red : diff.nivel === 'medio' ? C.yellow : C.dim
     log(
-      `  ${p(C.bold, t.id)} ${t.titulo.slice(0, 52).padEnd(52)} ` +
-        `${p(cor, t.risco.padEnd(6))} ${C.dim}${(t.componentes || []).join('/') || 'portal'}${C.reset}` +
+      `  ${p(C.bold, t.id)} ${t.titulo.slice(0, 44).padEnd(44)} ` +
+        `${p(cor, t.risco.padEnd(6))} ${p(corDiff, diff.nivel.padEnd(7))} ${C.dim}${(modelo || 'default do servidor')}${C.reset}` +
         (m ? `  ${p(C.yellow, m.mensagem)}` : ''),
     )
   }
+  log(p(C.dim, '  colunas: risco | dificuldade | modelo que o worker usará'))
 
   reconciliarEstados(store)
   log(`\n${p(C.dim, 'Rode "orq run" para despachar.')}`)
@@ -254,8 +317,12 @@ async function cmdStatus() {
   if (ativas.length) {
     log(p(C.bold, '\nEm execução agora:'))
     for (const t of ativas) {
-      const arqs = (t.arquivosAlterados || []).length
-      log(`  ${t.id}  sessão ${p(C.dim, t.sessionID || '?')}${t.worktree ? `  worktree ${p(C.dim, t.worktree)}` : ''}`)
+      // Modelo e dificuldade entram aqui porque o sintoma clássico de "a task
+      // travou" é não saber qual modelo estava atendendo: uma sessão parada sem
+      // modelo visível é indistinguível de provider travado.
+      const modelo = t.modelo || p(C.dim, 'default do servidor')
+      log(`  ${t.id}  sessão ${p(C.dim, t.sessionID || '?')}  ${p(C.dim, `modelo ${modelo}`)}`)
+      log(`         ${p(C.dim, `dificuldade ${t.dificuldade || '?'}${t.diffScore !== undefined ? ` (${t.diffScore})` : ''}`)}${t.worktree ? `  worktree ${p(C.dim, t.worktree)}` : ''}`)
     }
   }
 }
@@ -273,12 +340,31 @@ async function cmdReview(flags, pos) {
     return
   }
 
-  for (const tid of alvos) {
+for (const tid of alvos) {
     const task = store.obter(tid)
     if (!task) {
       erro(`Task ${tid} não existe.`)
       continue
     }
+
+    // Revisar task em estado que não espera revisão não é erro do revisor: é o
+    // estado que mudou. Sem esta checagem o `mudarEstado` lá embaixo estoura
+    // "Transição inválida" e a pessoa não descobre que pediu a revisão de algo
+    // já reprovado antes.
+    if (!['aguardando-revisao', 'bloqueada'].includes(task.estado)) {
+      erro(`${tid} está em "${task.estado}" e não espera revisão.`)
+      erro('  Revisão é do que o agente entregou. Para refazer: orq run.')
+      continue
+    }
+
+    // `bloqueada -> aguardando-integracao` é transição inválida de propósito:
+    // nada pode pular a revisão. Mas re-revisar uma task reprovada é legítimo,
+    // então ela volta pelo caminho normal antes de ser julgada de novo.
+    if (task.estado === 'bloqueada') {
+      store.mudarEstado(task.id, 'aguardando-revisao', {}, 'Revisão repetida')
+      log(p(C.dim, `  ${task.id} estava bloqueada — voltou para aguardando-revisao.`))
+    }
+
     const comps = componentesDaTask(cfg, task)
     const gates = []
     for (const c of comps) gates.push(...(cfg.componentes[c]?.gates || []))
@@ -877,6 +963,21 @@ async function cmdInstallAgents() {
   log(p(C.dim, 'Agentes globais: valem para qualquer repo. Para limitar ao portal, copie em portal/.opencode/agent/.'))
 }
 
+/**
+ * `orq sync-mcp` — delega ao tools/sync-mcp.mjs.
+ *
+ * Fica num script separado, e nao inline aqui, porque o arquivo faz parse de
+ * JSONC com tolerancia a comentario: essa logica tem teste proprio e nao deve
+ * nascer dentro de um arquivo que ja tem 900 linhas.
+ */
+async function cmdSyncMcp() {
+  const { spawnSync } = await import('node:child_process')
+  const { fileURLToPath } = await import('node:url')
+  const script = join(dirname(dirname(fileURLToPath(import.meta.url))), 'tools', 'sync-mcp.mjs')
+  const r = spawnSync(process.execPath, [script, ...process.argv.slice(3)], { stdio: 'inherit' })
+  if (r.status) process.exit(r.status ?? 1)
+}
+
 /* ------------------------------------------------------------------ main */
 
 const COMANDOS = {
@@ -894,6 +995,7 @@ const COMANDOS = {
   clean: cmdClean,
   'trello-sync': cmdTrelloSync,
   'install-agents': cmdInstallAgents,
+  'sync-mcp': cmdSyncMcp,
 }
 
 async function main() {
@@ -916,6 +1018,7 @@ ${p(C.bold, 'Comandos:')}
   clean <id>         remove do estado  (--worktree também apaga branch; --manter preserva a task)
   trello-sync        importa cards  (--board ID --listas "A,B")
   install-agents     instala os agentes orq-*
+  sync-mcp           escreve os MCPs do config em ~/.config/opencode/opencode.jsonc  (--dry-run)
 
 ${p(C.bold, 'Fluxo típico:')}
   orq init

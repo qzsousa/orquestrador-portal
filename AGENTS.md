@@ -65,6 +65,61 @@ cd backend && npm run prisma:generate
 `api.ts` é mais novo que o `dist`, os erros aparecem como "propriedade não
 existe" e parecem bug de código.
 
+## Skills: quem decide o que carrega
+
+O orquestrador **recomenda** as skills por task, em `src/core/runner.mjs`
+(`skillsSugeridas`): base pelo componente (portal, chamados, sce, monitor) mais
+o que o assunto da task pede (Prisma → `postgres-patterns`, bug →
+`verification-loop`, contrato → `eval-harness`, teste de tela →
+`webapp-testing`, …). `coding-standards` é o piso e sempre entra.
+
+A lista vai escrita no briefing, junto do nível de dificuldade. Ela é
+recomendação, não ordem: o agente pode carregar outra, e o briefing diz isso.
+O que não pode é ficar sem direção — por isso o "carregue a skill adequada"
+solto foi removido dos três agentes: com 27 nomes e nenhuma ordem, o agente
+carrega a primeira ou nenhuma.
+
+## Dificuldade → modelo
+
+`src/core/difficulty.mjs` classifica a task em `facil` / `medio` / `dificil`
+somando sinais que o orq já tem (risco do planner, critérios, tamanho do
+escopo, dependências, componentes, palavras de contrato/migração/auth) e
+descontando quando a task é subtarefa. É heurística boba e explicável de
+propósito: um número que muda o preço do workflow precisa ser auditável em
+`orq plan`, não vir de uma segunda fonte de opinião.
+
+O nível escolhe o modelo (`escolherModelo` em `config.mjs`) e vai no metadata
+da sessão e no estado da task, então "por que essa task rodou com esse modelo"
+tem resposta depois, sem depender de memória.
+
+Ordem de resolução: `models.byCompDifficulty[componente][nível]` →
+`models.byDifficulty[nível]` → `componentes[x].modelo` → `agentes.workerModel`
+→ `modelo` → default do servidor. `preferDifficulty: false` inverte a
+preferência para quem tem provider que só aceita um modelo.
+
+Tudo em `null` = comportamento antigo, um modelo só. `orq init` mostra a
+tabela effective e avisa (sem bloquear) quando a config aponta para um modelo
+fora da faixa gratuita que o orq conhece.
+
+## MCPs
+
+`orq sync-mcp` escreve os MCPs de `orq.config.mjs` em
+`~/.config/opencode/opencode.jsonc`. Vai no config **global** porque o
+`opencode serve` é um só e atende todas as tasks: um config por worktree
+sujaria N repositórios de produto e cada agente poderia reconfigurar as
+ferramentas alheias.
+
+O sync faz backup, preserva o que o orq não gerencia, e só remove servidor que
+ele mesmo escreveu antes (`mcp._orq.gerenciados` rastreia) — MCP instalado à
+mão sobrevive a `enabled: false`. Tokens `${worktreesDir}`, `${raiz}`,
+`${stateDir}` são resolvidos no sync.
+
+Default é só o filesystem, e só sobre os worktrees: um agente precisa ler os
+arquivos da própria task, e dar o repositório inteiro só amplia o que um commit
+errado alcança. `fetch` e `git` vêm desligados: o primeiro ignora o
+`webfetch: deny` dos agentes, o segundo reintroduz o `git reset` que o
+orquestrador existe para impedir.
+
 ## Estado de execução
 
 | Onde | O quê |
@@ -77,12 +132,11 @@ existe" e parecem bug de código.
 `.state/` e `logs/` estão no `.gitignore` e não devem ser versionados. Os
 worktrees também: são clones de trabalho, não fonte.
 
-## Skills disponiveis para agentes (OpenCode)
+## Skills instaladas (referência)
 
 As skills instaladas em `~/.config/opencode/skills` e `~/.config/opencode/skill`
-sao descobertas pelo OpenCode e aparecem em `available_skills`. Antes de
-trabalhar, cada agente (worker/reviewer/integrator) deve carregar via tool
-`skill` a skill relevante ao escopo da tarefa e seguir suas instrucoes.
+sao descobertas pelo OpenCode e aparecem em `available_skills`. A lista
+completa das skillsSugeridas do agente vem no briefing da task.
 
 Skills relevantes por frente:
 - Portal/frontend (React/Vite): `frontend-design`, `frontend-patterns`,

@@ -135,6 +135,107 @@ export const PADRAO = {
    * `null` = usa o default do servidor.
    */
   modelo: null,
+  /**
+   * Roteamento de modelo por DIFICULDADE da task (ver `calcularDificuldade`).
+   *
+   * Ordem de resolucao, do mais especifico ao mais genero:
+   *   models.byCompDifficulty[componente][nivel]
+   *   models.byDifficulty[nivel]        (so se preferDifficulty !== false)
+   *   componentes[componente].modelo
+   *   agentes.workerModel
+   *   modelo                              (global)
+   *   null                                (default do servidor)
+   *
+   * Default e `null` em tudo de proposito: sem configuracao explicita, o orq
+   * se comporta como antes desta feature. Quem liga o roteamento e a pessoa,
+   * em orq.config.mjs, sabendo o que o provider cobra.
+   *
+   * `preferDifficulty: false` inverte a preferencia: ai o modelo do COMPONENTE
+   * ganha do nivel, que e o que se quer quando um componente so aceita um
+   * provider especifico.
+   *
+   * ATENCAO — nome de modelo nao e palpite. Um id que nao existe no provider
+   * nao da erro no `opencode serve`: a sessao e criada e simplesmente nunca
+   * produz mensagem, e a task fica `em-andamento` para sempre. Foi assim que
+   * tres modelos inventados custaram uma rodada inteira de worktree.
+   *
+   * E por isso o `orq init` consulta o catalogo de verdade do servidor antes
+   * de avisar qualquer coisa. O snapshot abaixo e so a rede de seguranca para
+   * quando o servidor nao esta no ar.
+   */
+  models: {
+    preferDifficulty: true,
+    byDifficulty: { facil: null, medio: null, dificil: null },
+    byCompDifficulty: { chamados: {}, sce: {}, portal: {}, monitor: {} },
+    /**
+     * Modelos gratuitos do provider `opencode` que foram TESTADOS respondendo.
+     *
+     * NÃO é a lista de tudo que existe: é o que respondeu. O catálogo traz 10
+     * ids gratuitos, e nesta máquina 5 deles falham (503 upstream, Bad Request,
+     * corpo de requisição incompatível ou silêncio). Colocar aqui um id que
+     * existe mas não responde seria pior que não colocar: o `orq init` pararia
+     * de reclamar e a task voltaria a pendurar em silêncio.
+     *
+     * Consequência que fica explícita: o catálogo prova EXISTÊNCIA, não
+     * SAÚDE. Um id pode estar no catálogo e estar fora do ar agora — foi assim
+     * que o `nemotron-3.5-lightning-free` respondeu uma task e morreu na
+     * seguinte. Verificação de saúde é prompt de sondagem, não leitura de config.
+     */
+    listaDeModelosGratis: [
+      'opencode/space-bunny-free',
+      'opencode/longcat-2.5-preview-free',
+      'opencode/deepseek-v4.1-flash-free',
+      'opencode/mimo-v2.6-flash-free',
+      'opencode/big-pickle',
+    ],
+  },
+  /**
+   * MCPs que o `orq sync-mcp` escreve em ~/.config/opencode/opencode.jsonc.
+   *
+   * Por que o orq escreve no config GLOBAL e nao no worktree: o `opencode
+   * serve` e um so, atende N worktrees, e le o config do usuario. Um
+   * `.opencode/` por worktree tambem seria lido, alem de sujar N repositorios
+   * de produto com arquivo do orq -- e cada agente poderia reconfigurar as
+   * ferramentas alheias. Global e um lugar so, e versionado aqui.
+   *
+   * Tokens aceitos em qualquer posicao: `${worktreesDir}`, `${raiz}`,
+   * `${stateDir}`, resolvidos no sync. E assim que o escopo do filesystem
+   * acompanha `worktreesDir` sem caminho hardcoded no default.
+   *
+   * O SHAPE e o do OpenCode, nao um vocabulario nosso: `type` ("local"),
+   * `command` como array (executavel + argumentos) e `disabled`. Manter isso
+   * identico ao destino evita uma classe de bug — a primeira versao deste
+   * arquivo escrevia `type: "stdio"` com `command` string, e o servidor
+   * recusava o config INTEIRO, derrubando o OpenCode em qualquer diretorio.
+   * A unica traducao e `enabled` -> `disabled`, porque "desligado" e o que a
+   * pessoa escreve e "desligado" tambem e o que o orq decide.
+   *
+   * Default conservative de proposito: so o filesystem, e so sobre os
+   * worktrees. Um agente precisa ler os arquivos da propria task; dar o repo
+   * inteiro e nao dá nada.
+   */
+  mcp: {
+    enabled: true,
+    servers: {
+      filesystem: {
+        type: 'local',
+        command: ['npx', '-y', '@modelcontextprotocol/server-filesystem', '${worktreesDir}'],
+        enabled: true,
+      },
+      context7: {
+        type: 'local',
+        command: ['npx', '-y', '@upstash/context7-mcp'],
+        enabled: false,
+      },
+      sequentialThinking: {
+        type: 'local',
+        command: ['npx', '-y', '@modelcontextprotocol/server-sequential-thinking'],
+        enabled: false,
+      },
+      fetch: { type: 'local', command: ['npx', '-y', '@modelcontextprotocol/server-fetch'], enabled: false },
+      git: { type: 'local', command: ['npx', '-y', '@modelcontextprotocol/server-git'], enabled: false },
+    },
+  },
   /** Teto de tentativas antes de marcar como falhou. */
   maxTentativas: 2,
   /** Onde os worktrees das tasks nascem. Fora de qualquer repo de produto. */
@@ -193,11 +294,172 @@ export async function carregarConfig() {
  * Modelo de um componente, com o global como reserva.
  *
  * `@property {string} providerID` ex.: `opencode`, `nvidia`
- * @property {string} id` ex.: `step-5-preview-free`
+ * `@property {string} id` ex.: `step-5-preview-free`
  */
 export function modeloDoComponente(cfg, nome) {
   const doComp = cfg.componentes[nome]?.modelo
   return doComp || cfg.modelo || null
+}
+
+/**
+ * Modelo do agente de implementacao para uma task de dada dificuldade.
+ *
+ * `diff` e o retorno de `calcularDificuldade`; sem ele, cai no comportamento
+ * antigo (componente, depois worker global, depois global). O retorno e a
+ * configuracao crua: pode ser a string `"provider/modelo"` ou ja o objeto
+ * `{ providerID, id }`, e quem chama (o runner) normaliza. Nao normaliza aqui
+ * porque o `modeloDe` do runner ja faz isso e duas copias divergem.
+ *
+ * Retorna `null` = usa o default do servidor. Isso e intencional: modelo nao
+ * configurado nao e erro, e sim "deixa o OpenCode escolher".
+ */
+export function escolherModelo(cfg, compNome, diff) {
+  const base = modeloDoComponente(cfg, compNome) || cfg?.agentes?.workerModel || null
+
+  const nivel = diff?.nivel
+  if (!nivel) return base
+
+  const porComp = cfg?.models?.byCompDifficulty?.[compNome]?.[nivel]
+  if (porComp) return porComp
+
+  // `preferDifficulty: false` = o componente manda. Para provider que so
+  // aceita um modelo, é o que evita o worker cair no default do servidor e
+  // tomar 400 na criacao da sessao.
+  if (cfg?.models?.preferDifficulty !== false) {
+    const porNivel = cfg?.models?.byDifficulty?.[nivel]
+    if (porNivel) return porNivel
+  }
+
+  return base
+}
+
+/**
+ * Tabela de modelos que o orq usaria, por componente e nivel. Para o `orq
+ * init` mostrar a rota sem despachar nada, e para o `orq plan` deixar claro
+ * antes de gastar tempo de agente.
+ */
+export function tabelaDeModelos(cfg) {
+  const niveis = ['facil', 'medio', 'dificil']
+  const comps = Object.keys(cfg?.componentes || {})
+  return comps.map((comp) => ({
+    componente: comp,
+    porNivel: Object.fromEntries(niveis.map((n) => [n, escolherModelo(cfg, comp, { nivel: n })])),
+  }))
+}
+
+/**
+ * Modelos configurados que o orq não reconhece.
+ *
+ * `catalogo` é a lista de "provider/modelo" que o SERVIDOR disse que existem.
+ * Quando vem, ela manda: é o provider quem sabe o que existe, não uma lista
+ * escrita à mão. Sem ela (servidor fora do ar), cai no snapshot do config.
+ *
+ * Devolve avisos, nunca bloqueio. E o aviso é deliberadamente vago sobre o
+ * motivo — "fora do que eu conheço" vale tanto para id que não existe quanto
+ * para provider que acabou de cadastrar um modelo novo, e o orq não tem como
+ * distinguir um do outro sem o próprio provider dizer.
+ */
+export function avisosDeModelo(cfg, catalogo) {
+  const fonte = catalogo && catalogo.length ? catalogo : cfg?.models?.listaDeModelosGratis || []
+  if (!fonte.length) return []
+  const conhecidos = new Set(fonte)
+  const vistos = new Set()
+  const avisos = []
+  for (const linha of tabelaDeModelos(cfg)) {
+    for (const modelo of Object.values(linha.porNivel)) {
+      if (!modelo || typeof modelo !== 'string' || vistos.has(modelo)) continue
+      vistos.add(modelo)
+      if (!conhecidos.has(modelo)) {
+        avisos.push(
+          `${modelo} (${linha.componente}) nao esta ${catalogo?.length ? 'no catalogo do servidor' : 'na lista que o orq conhece'}`,
+        )
+      }
+    }
+  }
+  return avisos
+}
+
+/**
+ * Catálogo de modelos do servidor, em "provider/modelo".
+ *
+ * Best-effort de propósito: se o `opencode serve` não estiver no ar, devolve
+ * lista vazia e o `orq init` segue com o snapshot. Um `init` que falha porque
+ * o servidor não subiu é pior do que um `init` com informação parcial.
+ */
+export async function catalogoDeModelos(cfg) {
+  const { host, port } = cfg?.opencode || {}
+  if (!host || !port) return []
+  try {
+    // `connection: close` não é moda: sem isso o undici segura o socket em
+    // keep-alive e o Node pode imprimir tudo e não encerrar — o comando
+    // "termina" mas a janela do terminal fica presa esperando ele sair.
+    const r = await fetch(`http://${host}:${port}/config/providers`, {
+      signal: AbortSignal.timeout(4000),
+      headers: { connection: 'close' },
+    })
+    if (!r.ok) return []
+    const j = await r.json()
+    const provs = Array.isArray(j?.providers) ? j.providers : Object.values(j?.providers || {})
+    const saida = []
+    for (const p of provs) {
+      const models = p?.models
+      const ids = Array.isArray(models) ? models.map((m) => m.id) : Object.keys(models || {})
+      for (const id of ids) if (id) saida.push(`${p.id}/${id}`)
+    }
+    return saida
+} catch {
+    return []
+  }
+}
+
+/**
+ * MCPs que seriam sincronizados, no shape do OpenCode e com os tokens
+ * resolvidos.
+ *
+ * `sync-mcp` escreve estes em `~/.config/opencode/opencode.jsonc`. Nao abro o
+ * arquivo aqui: config e um detalhe do CLI, nao do registro de componentes.
+ *
+ * A traducao e toda feita aqui, num lugar so:
+ *   enabled  -> disabled    (nosso "desligado" e o flag dele)
+ *   command  -> array       (executavel + argumentos, como o schema exige)
+ *   args     -> fundido no command
+ *   env      -> environment
+ *
+ * O resto passa direto. `env` e `args` sao aceitos na entrada por
+ * conveniencia, mas nao sobrevive a saida: o que vai para o arquivo e
+ * exatamente o que o OpenCode aceita.
+ */
+export function mcpAtivos(cfg) {
+  if (cfg?.mcp?.enabled === false) return []
+  const tokens = {
+    worktreesDir: cfg?.worktreesDir || '',
+    raiz: cfg?.raiz || '',
+    stateDir: cfg?.stateDir || '',
+  }
+  const resolver = (v) => String(v).replace(/\$\{(\w+)\}/g, (_, k) => tokens[k] ?? `\${${k}}`)
+
+  const saida = []
+  for (const [nome, def] of Object.entries(cfg?.mcp?.servers || {})) {
+    if (!def || def.enabled === false) continue
+
+    const comando = Array.isArray(def.command) ? [...def.command] : [def.command, ...(def.args || [])]
+    if (!comando.length || !comando[0]) continue
+
+    const escrito = {
+      type: def.type || 'local',
+      command: comando.map(resolver),
+      disabled: def.enabled === false,
+    }
+    if (def.type === 'remote' && def.url) escrito.url = def.url
+    if (def.cwd) escrito.cwd = resolver(def.cwd)
+    const ambiente = def.environment || def.env
+    if (ambiente && Object.keys(ambiente).length) escrito.environment = ambiente
+    if (def.timeout !== undefined) escrito.timeout = def.timeout
+    if (def.headers) escrito.headers = def.headers
+
+    saida.push({ nome, def: escrito })
+  }
+  return saida
 }
 
 /** Caminho absoluto do repo de um componente, validando que ele existe. */
