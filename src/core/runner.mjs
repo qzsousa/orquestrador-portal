@@ -13,7 +13,7 @@
  * frente do responsável.
  */
 
-import { existsSync } from 'node:fs'
+import { existsSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import * as git from './git.mjs'
 import { extrairTexto, extrairErros, extrairFerramentas } from './opencode.mjs'
@@ -52,7 +52,46 @@ const SKILLS_POR_ASSUNTO = [
   { re: /seguran|permiss|autentica|sanitiz|token/i, skill: 'security-review' },
 ]
 
-export function skillsSugeridas(task, comps) {
+/**
+ * Skills que o OpenCode realmente vai encontrar nesta máquina.
+ *
+ * O AGENTS.md promete 27 skills em `~/.config/opencode/skills`, mas essa
+ * pasta não existe numa instalação qualquer: só a família do maestri aparece
+ * em `~/.claude/skills` e `~/.agents/skills`. Sem esta checagem, o briefing
+ * manda carregar `backend-patterns`, o agente gasta um turno descobrindo que
+ * não existe e ainda registra "sig[o] com as leituras" como se fosse uma
+ * decisão, quando na verdade foi um erro do orquestrador recommending
+ * fantasy.
+ *
+ * Os diretórios aqui são os mesmos que o OpenCode varre. Se a pessoa instalar
+ * as skills depois, a lista volta a aparecer sozinha — o briefing segue o
+ * ambiente em vez da lista wishful do repo.
+ */
+export function skillsInstaladas() {
+  const home = process.env.USERPROFILE || process.env.HOME || ''
+  const raizes = [
+    join(home, '.config', 'opencode', 'skill'),
+    join(home, '.config', 'opencode', 'skills'),
+    join(home, '.claude', 'skills'),
+    join(home, '.agents', 'skills'),
+  ]
+  const encontradas = new Set()
+  for (const raiz of raizes) {
+    let dirs = []
+    try {
+      dirs = readdirSync(raiz, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const d of dirs) {
+      if (!d.isDirectory()) continue
+      if (existsSync(join(raiz, d.name, 'SKILL.md'))) encontradas.add(d.name)
+    }
+  }
+  return encontradas
+}
+
+export function skillsSugeridas(task, comps, instaladas = null) {
   const texto = [task.titulo || '', task.descricao || '', ...(task.criterios || [])].join(' ').toLowerCase()
   const set = new Set()
   for (const c of comps || []) for (const s of SKILLS_POR_COMPONENTE[c] || []) set.add(s)
@@ -60,7 +99,13 @@ export function skillsSugeridas(task, comps) {
   // `coding-standards` e o piso: cobre qualquer repositorio, mesmo os que
   // nao estao no registro de componentes.
   set.add('coding-standards')
-  return [...set].sort()
+  const disponiveis = instaladas || skillsInstaladas()
+  const filtradas = [...set].filter((s) => disponiveis.has(s)).sort()
+  // O que ficou de fora vai junto, nomeado, para o briefing não mentir em
+  // silêncio: o agente sabe que não carregou aquilo porque não existe, e não
+  // porque o orquestrador esqueceu.
+  const ausentes = [...set].filter((s) => !disponiveis.has(s)).sort()
+  return { skills: filtradas, ausentes }
 }
 
 /**
@@ -74,18 +119,32 @@ export function montarBriefing({ cfg, task, worktree, branch, baseSha, docs = []
   const comps = componentesDaTask(cfg, task)
   const rotulosComponentes = comps.map((c) => `${c} (${cfg.componentes[c]?.rotulo || c})`).join(', ')
 
-  const skills = skillsSugeridas(task, comps)
-  const blocoSkills = skills.length
-    ? [
-        '## Skills recomendadas para esta task',
-        'Carregue via ferramenta `skill` antes de editar. Cada uma traz uma checklist; siga a checklist em vez de improvisar.',
-        ...skills.map((s) => `- ${s}`),
-        '',
-        'Esta lista é uma recomendação do orquestrador, derivada do componente e do assunto da task — não é uma lista fechada. Se uma skill fora daqui for obviamente a certa, carregue também.',
-        '',
-        '',
-      ].join('\n')
-    : ''
+const { skills, ausentes } = skillsSugeridas(task, comps)
+  const blocoSkills = [
+    '## Skills',
+    skills.length
+      ? [
+          '### Carregue estas antes de editar',
+          'Cada uma traz uma checklist; seguir a checklist é melhor que improvisar.',
+          ...skills.map((s) => `- ${s}`),
+          '',
+        ]
+      : [
+          '### Nenhuma skill instalada para esta task',
+          'A lista do orquestrador para este assunto não bate com o que existe nesta máquina,',
+          'então carregar skill aqui é perda de tempo. Trabalhe pelo AGENTS.md, pelo código e pelos gates.',
+          '',
+        ],
+    ausentes.length
+      ? [
+          `Não carregue estas: não estão instaladas (o orquestrador as sugere pela regra, mas não existem aqui): ${ausentes.join(', ')}.`,
+          '',
+        ]
+      : [],
+    'A lista é recomendação, não ordem. Se uma skill fora daqui for obviamente a certa, carregue também.',
+    '',
+    '',
+  ].join('\n')
 
   const blocoDificuldade = dificuldade
     ? [
@@ -405,13 +464,34 @@ export async function executarTask({ cfg, store, task, client, log = () => {} })
     const arquivos = git.arquivosAfetados(worktree, wt.baseSha)
 
     if (!commits.length) {
-      store.mudarEstado(
-        task.id,
-        'bloqueada',
-        { arquivosAlterados: arquivos },
-        'Nenhum commit após execução',
-      )
-      registro.erro = 'Nenhum commit produzido. A task não alterou nada.'
+      // "Nenhum commit" é o sintoma, não o diagnóstico. Antes de escrever isso
+      // na task — que lê como "o agente decidiu não mexer em nada" — o retrato da
+      // sessão diz qual dos dois casos aconteceu. As duas tentativas que
+      // primeirootivaram isto: o agente lia migration e schema, a sessão
+      // morria sem `error`, e o orq acusava a task de não ter alterado nada.
+      let retrato = null
+      try {
+        retrato = await client.diagnosticoDaSessao(sessao.id, worktree)
+      } catch {}
+
+      const leuAlgo = (retrato?.ferramentas || 0) > 0
+      const working = retrato && retrato.mensagens > 1 && leuAlgo && !retrato.escreveu
+
+      const diagnostico = retrato
+        ? `sessão teve ${retrato.mensagens} mensagens e ${retrato.ferramentas} ferramenta(s) (${retrato.nomeDasFerramentas.join(', ') || 'nenhuma'}), ${
+            retrato.escreveu ? 'chegou a escrever arquivo' : 'nunca chegou a escrever arquivo'
+          }, último texto do agente: ${
+            retrato.ultimoTexto ? `"${retrato.ultimoTexto.slice(0, 120).replace(/\s+/g, ' ')}"` : '(nenhum)'
+          }`
+        : 'não foi possível ler o histórico da sessão'
+
+      const motivo = working
+        ? 'Sessão morreu no meio (agente lia o escopo e parou sem erro)'
+        : 'Nenhum commit após execução'
+      store.mudarEstado(task.id, 'bloqueada', { arquivosAlterados: arquivos, diagnostico: { ...retrato, working } }, motivo)
+      registro.erro = working
+        ? `A sessão do agente morreu sem reportar erro: ${diagnostico}. Não é que a task não precisasse de nada — é que o provedor cortou o turno antes de editar.`
+        : `Nenhum commit produzido. ${diagnostico}.`
       return registro
     }
 

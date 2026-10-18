@@ -296,32 +296,64 @@ describe('mcpAtivos — o que o sync-mcp vai escrever', () => {
 })
 
 describe('skillsSugeridas — o que entra no briefing', () => {
+  // O conjunto instalado e passado na mao de proposito. Ler o disco aqui faria
+  // o teste passar numa maquina e falhar na outra conforme o que a pessoa
+  // instalou, e o que a gente quer verificar e a REGRA de escolha, nao a lista
+  // de skills de quem roda.
+  const TUDO = new Set([
+    'frontend-design', 'coding-standards', 'postgres-patterns', 'backend-patterns',
+    'verification-loop', 'eval-harness', 'webapp-testing',
+  ])
+
   test('componente define a base', () => {
-    const s = skillsSugeridas({ titulo: 'ajustar algo' }, ['portal'])
-    assert.ok(s.includes('frontend-design'))
-    assert.ok(s.includes('coding-standards'), 'piso para qualquer repo')
+    const { skills } = skillsSugeridas({ titulo: 'ajustar algo' }, ['portal'], TUDO)
+    assert.ok(skills.includes('frontend-design'))
+    assert.ok(skills.includes('coding-standards'), 'piso para qualquer repo')
   })
 
   test('assunto da task acrescenta skill específica', () => {
-    const s = skillsSugeridas({ titulo: 'migrar schema prisma' }, ['chamados'])
-    assert.ok(s.includes('postgres-patterns'))
-    assert.ok(s.includes('backend-patterns'))
+    const { skills } = skillsSugeridas({ titulo: 'migrar schema prisma' }, ['chamados'], TUDO)
+    assert.ok(skills.includes('postgres-patterns'))
+    assert.ok(skills.includes('backend-patterns'))
   })
 
   test('bug puxa verification-loop, contrato puxa eval-harness', () => {
-    assert.ok(skillsSugeridas({ titulo: 'corrigir erro no login' }, ['chamados']).includes('verification-loop'))
-    assert.ok(skillsSugeridas({ titulo: 'mudar contrato da API' }, ['chamados']).includes('eval-harness'))
+    assert.ok(skillsSugeridas({ titulo: 'corrigir erro no login' }, ['chamados'], TUDO).skills.includes('verification-loop'))
+    assert.ok(skillsSugeridas({ titulo: 'mudar contrato da API' }, ['chamados'], TUDO).skills.includes('eval-harness'))
   })
 
   test('componente fora do registro não quebra e ainda entrega o piso', () => {
-    const s = skillsSugeridas({ titulo: 'x' }, ['componente-desconhecido'])
-    assert.deepEqual(s, ['coding-standards'])
+    const { skills } = skillsSugeridas({ titulo: 'x' }, ['componente-desconhecido'], TUDO)
+    assert.deepEqual(skills, ['coding-standards'])
   })
 
   test('não devolve duplicado nem depende da ordem do array', () => {
-    const a = skillsSugeridas({ titulo: 'teste de tela' }, ['portal', 'monitor'])
-    const b = skillsSugeridas({ titulo: 'teste de tela' }, ['monitor', 'portal'])
+    const a = skillsSugeridas({ titulo: 'teste de tela' }, ['portal', 'monitor'], TUDO).skills
+    const b = skillsSugeridas({ titulo: 'teste de tela' }, ['monitor', 'portal'], TUDO).skills
     assert.deepEqual(a, b)
     assert.equal(new Set(a).size, a.length)
+  })
+
+  // O bug que motivou o filtro: numa maquina sem as 27 skills do AGENTS.md, o
+  // briefing mandava carregar backend-patterns e o agente gastava um turno
+  // descobrindo que a skill nao existe.
+  test('skill que não está instalada não vai no briefing, mas é declarada como ausente', () => {
+    const vazio = new Set()
+    const { skills, ausentes } = skillsSugeridas({ titulo: 'migrar schema prisma' }, ['chamados'], vazio)
+    assert.deepEqual(skills, [], 'nada de recomendar o que não existe')
+    assert.ok(ausentes.includes('backend-patterns'), 'a ausência é dita, não omitida')
+    assert.ok(ausentes.includes('coding-standards'))
+  })
+
+  test('parcialmente instalada: instala as que existem e nomeia as que não', () => {
+    const parcial = new Set(['coding-standards', 'backend-patterns'])
+    const { skills, ausentes } = skillsSugeridas({ titulo: 'migrar schema prisma' }, ['chamados'], parcial)
+    assert.deepEqual(skills, ['backend-patterns', 'coding-standards'])
+    // 'migrar' também é palavra de segurança, então ausentes não é uma lista
+    // de tamanho fixo. O invariante é a separação: instalada nunca aparece em
+    // ausentes, e a sugerida pelo assunto e não instalada aparece.
+    assert.ok(ausentes.includes('postgres-patterns'))
+    assert.ok(!ausentes.some((s) => parcial.has(s)), 'instalada não pode ser declarada ausente')
+    assert.equal(skills.length + ausentes.length, new Set([...skills, ...ausentes]).size, 'sem sobreposição nem duplicata')
   })
 })

@@ -440,6 +440,65 @@ export function revisar({ task, gates = [], permitirSujeira = false }) {
  * prova que o comportamento existe. Por isso a segunda parte, opcional, é um
  * segundo agente que lê o diff com critério.
  */
+/**
+ * Arquivos que um critério nomeia.
+ *
+ * Critério de aceitação costuma dizer ONDE a coisa tem que estar: "publicar o
+ * campo em CAMPOS_PUBLICAVEIS, src/routes/auth.ts:72-91". Isso é aproveitável
+ * mecanicamente e a revisão não usava: ela só contava palavra sobreposta com o
+ * relatório do agente e com as mensagens de commit.
+ *
+ * O que aconteceu: a T-003 aprovou com os 4 gates verdes e 5 de 8 critérios
+ * sem cobertura textual, sendo dois deles claramente não feitos — publish
+ * points em auth.ts e usuarios.ts e o arquivo de teste. Os testes antigos
+ * continuavam verdes, então o gate não viu. Ler o diff viu: nenhum dos
+ * arquivos nomeados tinha sido tocado.
+ *
+ * Não é prova de que o critério falhou — o arquivo pode já estar certo. É
+ * prova de que ninguém olhou. Por isso o sinal é "arquivo nomeado e não
+ * tocado", que é objetivo, e não "critério não atendido".
+ */
+export function arquivosDoCriterio(criterio) {
+  const out = new Set()
+  const texto = String(criterio || '')
+  // O diretório é opcional: `schema.prisma` e `package.json` são menções
+  // legítimas de arquivo. O que separa arquivo de palavra é a extensão — por
+  // isso `backend/prisma`, que não tem nenhuma, não entra.
+  const re = /(?:[\w.@-]+\/)*[\w.@-]+\.(?:ts|tsx|js|mjs|cjs|vue|prisma|sql|css|json|md)\b/g
+  for (const m of texto.match(re) || []) {
+    const limpo = m.replace(/[.,;:)]+$/, '')
+    // Descarta o que for só diretório: "backend/prisma" não é um arquivo.
+    if (!/\.[a-z0-9]+$/i.test(limpo)) continue
+    const norm = limpo.toLowerCase()
+    // Artefato gerado não faz parte de diff nenhum. O critério cita
+    // "dist/api.d.ts velho" para explicar um erro de typecheck, não para pedir
+    // que alguém edite o dist.
+    if (/(^|\/)(dist|build|node_modules|coverage)\//.test(norm)) continue
+    out.add(norm)
+  }
+  return [...out]
+}
+
+/** Arquivos que a task de fato tocou, normalizados para comparar com o critério. */
+export function arquivosTocados(revisaoMecanica) {
+  const todos = [
+    ...(revisaoMecanica?.evidencia?.arquivosCommitados || []),
+    ...(revisaoMecanica?.evidencia?.arquivosNaoCommitados || []),
+    ...(revisaoMecanica?.evidencia?.arquivos || []),
+  ]
+  const set = new Set()
+  for (const a of todos) {
+    const limpo = String(a).replace(/\\/g, '/').replace(/^[.\/]+/, '').toLowerCase()
+    set.add(limpo)
+    // O diff sai do repo do componente ("backend/src/routes/auth.ts") e o
+    // critério costuma citar relativo ao repo ("src/routes/auth.ts"). Guardar os
+    // dois desempata a comparação.
+    const i = limpo.indexOf('/')
+    if (i >= 0) set.add(limpo.slice(i + 1))
+  }
+  return set
+}
+
 export function avaliarCriterios({ task, revisaoMecanica, textoAgente = '' }) {
   const criterios = task.criterios || []
   if (!criterios.length) {
@@ -456,6 +515,8 @@ export function avaliarCriterios({ task, revisaoMecanica, textoAgente = '' }) {
     ...(revisaoMecanica?.evidencia?.arquivosCommitados || []).map((a) => a.toLowerCase()),
   ].join('\n')
 
+  const tocados = arquivosTocados(revisaoMecanica)
+
   const avaliados = []
   for (const c of criterios) {
     // Termos significativos: palavras com 4+ letras, ignorando stopwords.
@@ -465,24 +526,50 @@ export function avaliarCriterios({ task, revisaoMecanica, textoAgente = '' }) {
       .filter((t) => t.length >= 4 && !/^(para|com|que|não|nao|deve|ser|uma|dos|das|por|mais|sem|isso|este|esta|quando|onde|todo|toda)$/.test(t))
     const presentes = termos.filter((t) => corpus.includes(t))
     const cobertura = termos.length ? presentes.length / termos.length : 0
+    const arquivos = arquivosDoCriterio(c)
+    const arquivosIntactos = arquivos.filter((a) => {
+      if (tocados.has(a)) return false
+      // O critério cita o caminho pela cauda, o diff traz o caminho inteiro:
+      // "<timestamp>_add_cor_usuario/migration.sql" é o mesmo arquivo que
+      // "backend/prisma/migrations/2026.../migration.sql". Comparar só igualdade
+      // acusaria de falso positivo o arquivo que a task acabou de criar.
+      return ![...tocados].some((t) => t.endsWith('/' + a) || t === a || t.endsWith(a))
+    })
     avaliados.push({
       criterio: c,
       cobertura,
       evidenciado: cobertura >= 0.34,
       termosEncontrados: presentes,
+      arquivos,
+      arquivosNaoTocados: arquivosIntactos,
     })
   }
 
   const todosAtendidos = avaliados.every((a) => a.evidenciado)
   const naoAtendidos = avaliados.filter((a) => !a.evidenciado).map((a) => a.criterio)
+  // Sinal forte e mecânico: o critério aponta um arquivo, e a task não tocou
+  // esse arquivo. Cobertura textual baixa é ruído; arquivo intocado é fato.
+  const comArquivoIntacto = avaliados.filter((a) => a.arquivosNaoTocados.length)
+
+  const notas = []
+  notas.push(
+    naoAtendidos.length === 0
+      ? 'Todos os critérios têm evidência textual no resultado do agente.'
+      : `Sem evidência para ${naoAtendidos.length} de ${criterios.length} critérios. Isso NÃO é reprovação automática: cobertura textual é heurística. Confirme com o revisor.`,
+  )
+  if (comArquivoIntacto.length) {
+    notas.push(
+      `ATENÇÃO: ${comArquivoIntacto.length} critério(s) citam arquivo que a task não tocou — ` +
+        `${comArquivoIntacto.map((a) => a.arquivosNaoTocados.join(', ')).join(' | ')}. ` +
+        'Gates verdes não cobrem isso: os testes antigos continuam passando com o trabalho por fazer. Confira se o critério foi cumprido.',
+    )
+  }
 
   return {
     avaliados,
     todosAtendidos,
     naoAtendidos,
-    nota:
-      naoAtendidos.length === 0
-        ? 'Todos os critérios têm evidência textual no resultado do agente.'
-        : `Sem evidência para ${naoAtendidos.length} de ${criterios.length} critérios. Isso NÃO é reprovação automática: cobertura textual é heurística. Confirme com o revisor.`,
+    arquivosNaoTocados: comArquivoIntacto.map((a) => a.arquivosNaoTocados),
+    nota: notas.join(' '),
   }
 }

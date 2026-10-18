@@ -147,6 +147,64 @@ describe('agente que nem começou a rodar', () => {
   })
 })
 
+/* -------------------------------- sessão que morre sem reportar erro */
+
+describe('diagnosticoDaSessao — "nenhum commit" não é diagnóstico', () => {
+  // Sessão real que falhou três vezes: o agente lia migration, rodava grep,
+  // lia schema — e a sessão parava. Sem `error` em nenhuma parte, o que fazia o
+  // `extrairErros` devolver lista vazia e o orq escrever "a task não alterou
+  // nada". Era mentira: o agente não decidiu nada, ele deixou de existir.
+  const sessaoMorta = [
+    { info: { role: 'user' }, parts: [{ type: 'text', text: 'briefing' }] },
+    { info: { role: 'assistant' }, parts: [{ type: 'text', text: 'Vou ler as migrations.' }] },
+    { info: { role: 'assistant' }, parts: [{ type: 'tool', tool: 'read', state: { status: 'completed' } }] },
+    { info: { role: 'assistant' }, parts: [{ type: 'tool', tool: 'grep', state: { status: 'completed' } }] },
+    { info: { role: 'assistant' }, parts: [{ type: 'tool', tool: 'bash', state: { status: 'completed' } }] },
+  ]
+
+  // O content-type importa: `request()` desvia para o parser de texto quando a
+  // resposta não se declara JSON, e um mock sem header faz todo retrato virar
+  // zero — que é exatamente o sintoma que estamos tentando evitar.
+  const client = (msgs) =>
+    new OpencodeClient({
+      fetchImpl: async () =>
+        new Response(JSON.stringify(msgs), { status: 200, headers: { 'content-type': 'application/json' } }),
+    })
+
+  test('sessão que lia mas não escrevesse é marcada como morta, não como vazia', async () => {
+    const r = await client(sessaoMorta).diagnosticoDaSessao('s1', '/dir')
+    assert.equal(r.mensagens, 5)
+    assert.equal(r.ferramentas, 3)
+    assert.deepEqual(r.nomeDasFerramentas, ['read', 'grep', 'bash'])
+    assert.equal(r.escreveu, false)
+  })
+
+  test('sessão que escreveu é distinguir de uma que só leu', async () => {
+    const comEdicao = [...sessaoMorta, { info: { role: 'assistant' }, parts: [{ type: 'tool', tool: 'edit', state: { status: 'completed' } }] }]
+    const r = await client(comEdicao).diagnosticoDaSessao('s2', '/dir')
+    assert.equal(r.escreveu, true, 'edit/write/patch marcam que o agente começou a produzir')
+  })
+
+  test('write e patch também contam como escrita, não só edit', async () => {
+    for (const tool of ['write', 'patch']) {
+      const r = await client([{ info: { role: 'assistant' }, parts: [{ type: 'tool', tool, state: {} }] }]).diagnosticoDaSessao('s', '/dir')
+      assert.equal(r.escreveu, true, `${tool} tem que contar`)
+    }
+  })
+
+  test('sessão vazia não vira retrato inventado', async () => {
+    const r = await client([]).diagnosticoDaSessao('s3', '/dir')
+    assert.equal(r.mensagens, 0)
+    assert.equal(r.ferramentas, 0)
+    assert.equal(r.escreveu, false)
+  })
+
+  test('o último texto do agente fica disponível para o diagnóstico citar', async () => {
+    const r = await client(sessaoMorta).diagnosticoDaSessao('s4', '/dir')
+    assert.equal(r.ultimoTexto, 'Vou ler as migrations.')
+  })
+})
+
 /* ------------------------------------------ execução longa sem POST travado */
 
 describe('esperarAgente — o agente pode levar mais de 5 minutos', () => {

@@ -281,6 +281,44 @@ throw new OpencodeError(`agente não terminou em ${Math.round(timeoutMs / 1000)}
     })
   }
 
+  /**
+   * Retrato de como a sessão morreu.
+   *
+   * A última mensagem não basta para dizer por que uma task não virou commit.
+   * Houve task em que o agente leu migration, rodou grep, leu schema — e a
+   * sessão simplesmente parou, sem `error` em lugar nenhum. Do ponto de vista
+   * do `extrairErros`, isso é uma execução limpa: zero erro, zero commit. E a
+   * mensagem que o orq escrevia era "a task não alterou nada", que é uma
+   * afirmação falsa — o agente não decidiu não mexer em nada, ele deixou de
+   * existir no meio do caminho.
+   *
+   * Estes números separam os dois casos: mensagens > 1 com ferramentas usadas
+   * e nenhuma edição é sessão morta. Edição é o que distingue "trabalhou e não
+   * commitou" (o forçador de commit resolve) de "não chegou a começar".
+   */
+  async diagnosticoDaSessao(sessionID, directory) {
+    const msgs = await this.mensagens(sessionID, directory)
+    const lista = Array.isArray(msgs) ? msgs : []
+    const ferramentas = []
+    let ultimoTexto = ''
+    for (const m of lista) {
+      for (const p of m?.parts || []) {
+        if (p?.type === 'tool' && p.tool) ferramentas.push(p.tool)
+        if (p?.type === 'text' && p.text && m?.info?.role === 'assistant') ultimoTexto = p.text
+      }
+    }
+    return {
+      mensagens: lista.length,
+      ferramentas: ferramentas.length,
+      nomeDasFerramentas: [...new Set(ferramentas)],
+      // Respondeu com texto que não é só narração? O relatório do agente é a
+      // prova de que ele chegou ao fim do turno.
+      ultimoTexto,
+      // Escrever é o que separa "não começou" de "não terminou".
+      escreveu: ferramentas.some((t) => ['edit', 'write', 'patch'].includes(t)),
+    }
+  }
+
   /** Último texto que o agente escreveu, ou '' se não houver. */
   async ultimoTextoDoAgente(sessionID, directory) {
     const msgs = await this.mensagens(sessionID, directory)

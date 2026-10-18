@@ -55,10 +55,14 @@ function parseArgs(argv) {
     if (a.startsWith('--')) {
       const chave = a.slice(2)
       const proximo = argv[i + 1]
+      // Flag repetida acumula em array em vez de sobrescrever. Antes, `--crit A
+      // --crit B` guardava so B: os criterios de aceitacao sao o que a revisao
+      // avalia, e perder a maioria deles nao dava erro nenhum - a task Passing
+      // com metade dos criterios e o pior jeito de falhar.
       if (proximo === undefined || proximo.startsWith('--')) {
-        flags[chave] = true
+        flags[chave] = flags[chave] === undefined ? true : [].concat(flags[chave], true)
       } else {
-        flags[chave] = proximo
+        flags[chave] = flags[chave] === undefined ? proximo : [].concat(flags[chave], proximo)
         i++
       }
     } else {
@@ -66,6 +70,15 @@ function parseArgs(argv) {
     }
   }
   return { pos, flags }
+}
+
+/** Valor de flag como lista: um `--crit A --crit B` e um `--crit "A;B"`. */
+function listaDeFlag(valor, sep = /[;,]/) {
+  if (valor === undefined || valor === true) return undefined
+  return [].concat(valor)
+    .flatMap((v) => String(v).split(sep))
+    .map((s) => s.trim())
+    .filter(Boolean)
 }
 
 function storeDe(cfg) {
@@ -178,10 +191,10 @@ async function cmdAdd(flags, pos) {
     titulo: texto,
     descricao: texto,
     descricaoLonga: undefined,
-    componentes: flags.comp ? String(flags.comp).split(',').map((s) => s.trim()) : undefined,
-    criterios: flags.crit ? String(flags.crit).split(';').map((s) => s.trim()) : undefined,
-    dependsOn: flags.dep ? String(flags.dep).split(',').map((s) => s.trim()) : undefined,
-    arquivosAlvo: flags.arq ? String(flags.arq).split(',').map((s) => s.trim()) : undefined,
+componentes: listaDeFlag(flags.comp, /,/),
+  criterios: listaDeFlag(flags.crit, /;/),
+  dependsOn: listaDeFlag(flags.dep, /,/),
+  arquivosAlvo: listaDeFlag(flags.arq, /,/),
     prioridade: flags.prio ? Number(flags.prio) : undefined,
   })
 
