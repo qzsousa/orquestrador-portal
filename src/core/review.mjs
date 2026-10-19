@@ -298,6 +298,9 @@ export function culpaDaTask(gate, arquivosDaTask) {
 export function revisar({ task, gates = [], permitirSujeira = false }) {
   const criticos = []
   const avisos = []
+  // Falha que é da máquina, não da task. Não reprova, mas também não some:
+  // uma revisão que aprova calada com um gate que não rodou é pior que reprovar.
+  const criticosAmbientais = []
   const worktree = task.worktree
 
   if (!worktree || !existsSync(worktree)) {
@@ -392,6 +395,16 @@ export function revisar({ task, gates = [], permitirSujeira = false }) {
         const causa = r.erroSpawn ? `falha ao rodar: ${r.erroSpawn}` : `exit ${r.exitCode}`
         const meusArquivos = [...arquivosCommitados, ...sujos]
 
+        // Arquivo travado por outro processo não é defeito da task. Reprovar
+        // aqui obriga a desligar o backend e rodar de novo sem ninguém saber
+        // por quê — e a task está ótima.
+        const ambiente = falhaDeAmbiente({ ...r, nome: g.nome, fase })
+        if (ambiente) {
+          criticosAmbientais.push(`${ambiente.gate}: ${ambiente.causa} ${ambiente.remedy}`)
+          avisos.push(`Gate "${g.nome}" falhou por ambiente, não pela task. ${ambiente.causa}`)
+          continue
+        }
+
         // Falha de preparação é sempre da task: sem o artefato, nada foi
         // verificado de verdade. Não dá para culpar "conteúdo pré-existente".
         if (fase === 'preparar') {
@@ -426,6 +439,10 @@ export function revisar({ task, gates = [], permitirSujeira = false }) {
   return {
     aprovado: criticos.length === 0,
     criticos,
+    // Vai para a tela e para o log junto da aprovação: `aprovado: true` com
+    // esta lista cheia significa "a task passou, e este gate não rodou por
+    // causa da máquina". Quem lê precisa ver as duas coisas.
+    criticosAmbientais,
     avisos,
     gates: resultadosGates,
     evidencia,
@@ -458,9 +475,42 @@ export function revisar({ task, gates = [], permitirSujeira = false }) {
  * prova de que ninguém olhou. Por isso o sinal é "arquivo nomeado e não
  * tocado", que é objetivo, e não "critério não atendido".
  */
+/**
+ * O critério está mandando MUDAR o arquivo, ou só usando como referência?
+ *
+ * Sem essa distinção o sinal de "arquivo nomeado e não tocado" vira ruído, e
+ * ruído treina a pessoa a ignorar o sinal. Aconteceu na T-004: sete critérios
+ * acusados porque citam `escolas.ts`, `dashboard.ts`, `middleware/auth.ts` e
+ * `zodError.ts` como PADRÃO A COPIAR — "copiando a estrutura de", "usando a
+ * lógica que já existe em", "reusando requireRole de". Nenhum deles devia ser
+ * tocado, e nenhum foi.
+ *
+ * A lista é curta e declarativa de propósito: tentativa de ler o português
+ * inteiro aqui produziria mais erro que acerto. O padrão que falha é
+ * conservatism — se houver dúvida, o arquivo é tratado como mudança.
+ */
+const CITACAO_COMO_REFERENCIA =
+  /\b(copi\w*|no mesmo estilo|padr(ã|a)o de|como refer(ê|e)ncia|reusando|reaproveit\w*|ja existe|já existe|mesmo caminho|mesmo padrao|mesmo padrão)\b/i
+
+/**
+ * "responder com isZodError de src/utils/zodError.ts", "usar requireRole de
+ * src/middleware/auth.ts": o caminho vem depois de um identificador e de um
+ * "de", o que descreve referência e não mudança. Sem isto, os critérios do
+ * próprio orq acusam arquivos que nunca deveriam ser tocados.
+ */
+const REFERENCIA_APOS_IDENTIFICADOR = /\bcom\s+[\w$.]+\s+de\s/i
+
+/**
+ * Arquivos que um critério nomeia.
+ *
+ * Só entra aqui o que o critério manda MUDAR. Arquivo citado como referência
+ * volta vazio de propósito: acusar "não tocou" num arquivo que era só exemplo
+ * seria trocar um silêncio ruim por um alarme ruim.
+ */
 export function arquivosDoCriterio(criterio) {
   const out = new Set()
   const texto = String(criterio || '')
+  if (CITACAO_COMO_REFERENCIA.test(texto) || REFERENCIA_APOS_IDENTIFICADOR.test(texto)) return []
   // O diretório é opcional: `schema.prisma` e `package.json` são menções
   // legítimas de arquivo. O que separa arquivo de palavra é a extensão — por
   // isso `backend/prisma`, que não tem nenhuma, não entra.
@@ -497,6 +547,36 @@ export function arquivosTocados(revisaoMecanica) {
     if (i >= 0) set.add(limpo.slice(i + 1))
   }
   return set
+}
+
+/**
+ * Falha que é do AMBIENTE, não da task.
+ *
+ * `prisma generate` reescreve o query engine dentro de `node_modules`, e o
+ * worktree compartilha esse diretório com o repo base. Com o backend de dev no
+ * ar, o Windows trava o DLL e o comando morre com EPERM ao renomear. Isso
+ * aconteceu quatro vezes numa sessão, e cada vez REPROVOU a task — o que é
+ * mentira: a task está ótima e o gate nem chegou a olhar o código dela.
+ *
+ * Reprovar aqui obriga a pessoa a desligar o servidor e rodar de novo, sem
+ * nenhuma pista de por quê. O sinal é específico de propósito: EPERM/EBUSY ao
+ * renomear o engine do Prisma é arquivo em uso no Windows, e nada que a task
+ * escreva muda isso.
+ */
+export function falhaDeAmbiente(g) {
+  if (!g || g.ok) return null
+  if (g.fase !== 'preparar') return null
+  const texto = `${g.stdout || ''}\n${g.stderr || ''}`
+  const prismaTravado = /query_engine[\w.-]*\.dll\.node|query_engine-windows/i.test(texto)
+  const arquivoEmUso = /\b(EPERM|EBUSY)\b/i.test(texto) && /rename|unlink/i.test(texto)
+  if (!prismaTravado || !arquivoEmUso) return null
+  return {
+    gate: g.nome,
+    causa:
+      'O backend de dev está segurando o DLL do Prisma. O worktree compartilha node_modules com o repo base, ' +
+      'e o prisma generate não consegue renomear query_engine-windows.dll.node com o servidor no ar.',
+    remedy: 'Pare o backend (dev-restart para subir de novo), rode o gate de novo. Nada a corrigir na task.',
+  }
 }
 
 export function avaliarCriterios({ task, revisaoMecanica, textoAgente = '' }) {

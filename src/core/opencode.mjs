@@ -27,6 +27,14 @@ import { join } from 'node:path'
 
 const PORTA_PADRAO = 4653
 
+/**
+ * Valores de `finish` que encerram o turno de verdade.
+ *
+ * `tool-calls` NÃO entra: é o estado de uma mensagem que vai ser seguida de
+ * outras. Ver o comentário em `esperarAgente`.
+ */
+const FINALIZACOES_TERMINAIS = ['stop', 'length', 'content-filter', 'error', 'abort', 'other']
+
 const dormir = (ms) => new Promise((r) => setTimeout(r, ms))
 
 export class OpencodeError extends Error {
@@ -201,16 +209,81 @@ export class OpencodeClient {
   }
 
   /**
+   * Ferramenta travada: rodando há mais tempo do que ela mesma declarou.
+   *
+   * A T-006 passou 30 minutos em `em-andamento` com uma mensagem parada e um
+   * `read` que nunca voltou. O `esperarAgente` só olhava a última mensagem e
+   * ficou esperando o prazo inteiro — e abortar a sessão por fora não adiantou,
+   * porque quem esperava não olhava para o abort, só para a mensagem.
+   *
+   * "Nenhuma mensagem nova" NÃO serve de sinal: `npm test` e `prisma generate`
+   * legítimamente somem por minutos. O que não tem como ser normal é uma
+   * ferramenta continuar `running` depois do timeout que ela mesma declarou no
+   * input — o servidor deu o prazo, o prazo passou, e nada aconteceu.
+   *
+   * A folga existe porque o servidor não marca a ferramenta como falhada no
+   * instante do timeout; ela leva alguns segundos para virar `error`.
+   */
+  static FERRAMENTA_TRAVADA(retrato, agora = Date.now(), folgaMs = 90000) {
+    const timeoutDeclarado = (p) => {
+      const t = p?.state?.input?.timeout
+      return typeof t === 'number' && t > 0 ? t : 120000
+    }
+    for (const p of retrato?.parts || []) {
+      if (p?.type !== 'tool' || p.state?.status !== 'running') continue
+      const inicio = p.state?.time?.start
+      if (!inicio) continue
+      const passou = agora - inicio
+      if (passou > timeoutDeclarado(p) + folgaMs) {
+        return { ferramenta: p.tool, rodandoHaMs: passou, timeoutDeclarado: timeoutDeclarado(p) }
+      }
+    }
+    return null
+  }
+
+  /**
+   * Turno que não produziu nada: existe mensagem de assistant, mas ela está
+   * vazia (zero parts), sem `finish`, e continua assim há mais tempo do que um
+   * modelo leva para começar a responder.
+   *
+   * É o outro lado da sessão parada: a de ferramenta travada tem parte de
+   * tool; esta não tem parte nenhuma. O stream abriu (`prompt_async` devolveu
+   * 204) e nunca veio nada — e sem isto o orquestrador espera o prazo inteiro
+   * olhando para uma mensagem vazia.
+   */
+  static TURNO_SEM_PRODUCAO(retrato, agora = Date.now(), limiteMs = 180000) {
+    if (!retrato?.info || retrato.info.role !== 'assistant') return null
+    if (retrato.info.finish || retrato.info.error) return null
+    const parts = retrato.parts || []
+    // Uma parte de texto incompleta já é progresso: o modelo está escrevendo.
+    if (parts.some((p) => p?.type === 'text' && (p.text || '').length > 0)) return null
+    if (parts.length > 0) return null
+    const criada = retrato.info?.time?.created
+    if (!criada) return null
+    const paradaHa = agora - criada
+    if (paradaHa < limiteMs) return null
+    return {
+      paradaHaMs: paradaHa,
+      minutos: Math.round(paradaHa / 60000),
+    }
+  }
+
+  /**
    * Aguarda o agente terminar, por polling das mensagens.
    *
-   * Terminado = a última mensagem de assistant ganhou um `finish` (ou um
-   * `error`). Enquanto ela está em andamento, `finish` vem vazio.
+   * Terminado = a última mensagem de assistant ganhou um `finish` TERMINAL (ou
+   * um `error`). `finish: "tool-calls"` não termina o turno — ver
+   * FINALIZACOES_TERMINAIS.
+   *
+   * Também devolve quando uma ferramenta trava ou quando o turno não produz
+   * nada, porque esperar o prazo inteiro por uma sessão morta é a mesma espera
+   * que o `timeoutMs` promete evitar.
    *
    * Um erro de rede no meio do polling não aborta a espera: um agente pode
    * levar 40 minutos e não é razoável perder o trabalho por um pico de 2
    * segundos. Só desiste depois de várias falhas seguidas.
    */
-  async esperarAgente({ sessionID, directory, timeoutMs = 1800000, intervaloMs = 3000, maxFalhasConsecutivas = 5, log = () => {}, cancelado, abortarAoCancelar = false }) {
+  async esperarAgente({ sessionID, directory, timeoutMs = 1800000, intervaloMs = 3000, maxFalhasConsecutivas = 5, log = () => {}, cancelado, abortarAoCancelar = false, folgaTravadaMs = 90000, semProducaoMs = 180000 }) {
     const limite = Date.now() + timeoutMs
     let falhasConsecutivas = 0
 
@@ -230,8 +303,42 @@ export class OpencodeClient {
         for (let i = lista.length - 1; i >= 0; i--) {
           const info = lista[i]?.info
           if (info?.role !== 'assistant') continue
-          if (info.error || info.finish) return lista[i]
-          log(`      ${info.id} ainda trabalhando`)
+          if (info.error) return lista[i]
+          // `finish` NÃO é sinal de turno encerrado. Uma mensagem de assistant
+          // que decide chamar ferramenta recebe `finish: "tool-calls"` e o turno
+          // continua na mensagem seguinte — e `time.completed` vem preenchido
+          // junto, então ele também não serve.
+          //
+          // Tratar qualquer `finish` como fim fez o orquestrador matar as
+          // próprias sessões: ele retornava no primeiro "tool-calls" e o
+          // `finally` chamava /abort com o agente no meio do trabalho. Era o
+          // que matava a task, e a mensagem dizia "nenhum commit" — um
+          // diagnóstico errado para um agente que estava lendo arquivos.
+          if (FINALIZACOES_TERMINAIS.includes(info.finish)) return lista[i]
+
+          const travada = OpencodeClient.FERRAMENTA_TRAVADA(lista[i], Date.now(), folgaTravadaMs)
+          if (travada) {
+            const minutos = Math.round(travada.rodandoHaMs / 60000)
+            log(`      ${info.id} travado em ${travada.ferramenta} há ${minutos}min (timeout declarado ${Math.round(travada.timeoutDeclarado / 1000)}s)`)
+            const marca = { ...lista[i], info: { ...info, error: { name: 'FerramentaTravada', data: { message: `\`${travada.ferramenta}\` ficou rodando ${minutos}min, acima do timeout de ${Math.round(travada.timeoutDeclarado / 1000)}s que ela declarou. A sessão parou de progredir.` } } } }
+            return marca
+          }
+
+          const semProducao = OpencodeClient.TURNO_SEM_PRODUCAO(lista[i], Date.now(), semProducaoMs)
+          if (semProducao) {
+            log(`      ${info.id} sem nenhuma parte há ${semProducao.minutos}min`)
+            return {
+              ...lista[i],
+              info: {
+                ...info,
+                error: {
+                  name: 'TurnoSemProducao',
+                  data: { message: `O stream abriu mas o modelo não produziu nada em ${semProducao.minutos}min. Não é que a task não precisasse de nada: o provedor não respondeu.` },
+                },
+              },
+            }
+          }
+          log(`      ${info.id} ainda trabalhando (${info.finish || 'sem finish'})`)
           break
         }
       } catch (err) {

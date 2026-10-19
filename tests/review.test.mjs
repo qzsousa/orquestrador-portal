@@ -1,6 +1,6 @@
 import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
-import { avaliarCriterios, arquivosDoCriterio, arquivosTocados } from '../src/core/review.mjs'
+import { avaliarCriterios, arquivosDoCriterio, arquivosTocados, falhaDeAmbiente } from '../src/core/review.mjs'
 
 /**
  * Critério de aceitação costuma dizer ONDE a mudança tem que estar. A revisão
@@ -31,9 +31,31 @@ describe('arquivosDoCriterio — o caminho que o critério aponta', () => {
   })
 
   test('limpa pontuação que vem da prosa', () => {
-    const a = arquivosDoCriterio('copie o padrão de shared/types/api.ts (api.ts:790) e de x.vue.')
+    const a = arquivosDoCriterio('mexa em shared/types/api.ts (api.ts:790) e em x.vue.')
     assert.ok(a.includes('shared/types/api.ts'))
     assert.ok(a.includes('x.vue'))
+  })
+
+  // Arquivo citado como PADRÃO não é arquivo a mudar. Sem isso, o sinal grita
+  // "não tocou" sobre `escolas.ts` toda vez que um critério manda copiar a
+  // estrutura de lá, e quem lê aprende a ignorar o sinal.
+  test('critério que cita arquivo como referência não gera sinal', () => {
+    assert.deepEqual(arquivosDoCriterio('copiando a estrutura de src/routes/escolas.ts:50-96 para o GET'), [])
+    assert.deepEqual(arquivosDoCriterio('usando a logica que ja existe em src/routes/dashboard.ts:58-77'), [])
+    assert.deepEqual(arquivosDoCriterio('reusando requireRole de src/middleware/auth.ts:97-111'), [])
+    assert.deepEqual(arquivosDoCriterio('responder com isZodError de src/utils/zodError.ts:21-23'), [])
+  })
+
+  test('critério que manda mudar o arquivo continua gerando sinal', () => {
+    const a = arquivosDoCriterio('publicar o campo nos 4 pontos: CAMPOS_PUBLICAVEIS em src/routes/auth.ts:72-91')
+    assert.deepEqual(a, ['src/routes/auth.ts'])
+  })
+
+  test('duvida resolve para mudança: sem marcador de referência, o arquivo conta', () => {
+    // "em X" aparece nos dois sentidos ("publicar em X" e "a logica em X"). Na
+    // dúvida o sinal acusa, porque o custo de accuse falso é uma conferida.
+    const a = arquivosDoCriterio('o select de attachUserRecord em src/middleware/auth.ts:71-82')
+    assert.deepEqual(a, ['src/middleware/auth.ts'])
   })
 })
 
@@ -48,6 +70,47 @@ describe('arquivosTocados — normaliza o diff para comparar', () => {
   test('normaliza barra invertida do Windows', () => {
     const t = arquivosTocados({ evidencia: { arquivosCommitados: ['backend\\src\\routes\\auth.ts'] } })
     assert.ok(t.has('backend/src/routes/auth.ts'))
+  })
+})
+
+describe('falhaDeAmbiente — gate que falha por causa da máquina', () => {
+  // `prisma generate` reescreve o query engine dentro de node_modules, e o
+  // worktree compartilha esse diretório com o repo base. Com o backend de dev
+  // no ar, o Windows trava o DLL. Aconteceu 4 vezes e cada vez REPROVOU a task.
+  const epem = {
+    nome: 'prisma:generate',
+    fase: 'preparar',
+    ok: false,
+    stderr:
+      "Error: EPERM: operation not permitted, rename 'C:\\chamados\\backend\\node_modules\\.prisma\\client\\query_engine-windows.dll.node.tmp1' -> 'query_engine-windows.dll.node'",
+  }
+
+  test('DLL do Prisma travado é ambiente, com o remédio nomeado', () => {
+    const r = falhaDeAmbiente(epem)
+    assert.equal(r.gate, 'prisma:generate')
+    assert.match(r.remedy, /Pare o backend/)
+    assert.match(r.remedy, /Nada a corrigir na task/)
+  })
+
+  test('falha de verdade da task NÃO é classificada como ambiente', () => {
+    assert.equal(falhaDeAmbiente({ nome: 'typecheck', fase: 'validar', ok: false, stderr: 'agenda.ts:10:5 error TS2345' }), null)
+    assert.equal(falhaDeAmbiente({ nome: 'prisma:generate', fase: 'preparar', ok: false, stderr: 'P1001 Cannot reach database server' }), null)
+  })
+
+  test('EPERM em gate que não é o Prisma continua sendo falha', () => {
+    assert.equal(
+      falhaDeAmbiente({ nome: 'build', fase: 'preparar', ok: false, stderr: "EPERM: operation not permitted, rename 'x' -> 'y'" }),
+      null,
+      'sem menção ao engine do Prisma não é o caso conhecido',
+    )
+  })
+
+  test('gate que passou não gera diagnóstico', () => {
+    assert.equal(falhaDeAmbiente({ nome: 'prisma:generate', fase: 'preparar', ok: true }), null)
+  })
+
+  test('EPERM fora da fase de preparação não escapa da reprovação', () => {
+    assert.equal(falhaDeAmbiente({ ...epem, fase: 'validar' }), null)
   })
 })
 
@@ -93,7 +156,7 @@ describe('avaliarCriterios — arquivo nomeado e não tocado é sinal forte', ()
   })
 
   test('o alerta explica que gate verde não cobre isso', () => {
-    const task = { criterios: ['teste em src/routes/usuarios.test.ts copiando o padrão'] }
+    const task = { criterios: ['o teste tem que entrar em src/routes/usuarios.test.ts'] }
     const r = avaliarCriterios({ task, revisaoMecanica, textoAgente: '' })
     assert.match(r.nota, /testes antigos continuam passando/)
   })

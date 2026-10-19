@@ -215,7 +215,7 @@ describe('esperarAgente — o agente pode levar mais de 5 minutos', () => {
     json: async () => corpo,
   })
 
-  const assistant = (finish, erro) => ({ info: { role: 'assistant', finish, error: erro }, parts: [] })
+  const assistant = (finish, erro, extra) => ({ info: { role: 'assistant', finish, error: erro, ...extra }, parts: [] })
 
   test('devolve assim que a última mensagem ganha finish', async () => {
     let n = 0
@@ -229,6 +229,135 @@ describe('esperarAgente — o agente pode levar mais de 5 minutos', () => {
     const r = await client.esperarAgente({ sessionID: 'ses_x', intervaloMs: 1 })
     assert.equal(r.info.finish, 'stop')
     assert.equal(n, 3)
+  })
+
+  // A regressão que matava as tasks: uma mensagem de assistant que chama
+  // ferramenta tem `finish: "tool-calls"` e `time.completed` preenchido, e o
+  // turno CONTINUA na mensagem seguinte. Ler `finish` como "terminou" fazia o
+  // orquestrador retornar no primeiro tool-calls e o `finally` chamar /abort
+  // com o agente no meio — o worktree ficava intocado e a task era reportada
+  // como "nenhum commit", que é falso.
+  test('finish "tool-calls" NAO encerra o turno: o agente continua trabalhando', async () => {
+    let n = 0
+    const client = new OpencodeClient({
+      fetchImpl: async () => {
+        n++
+        // tres mensagens de tool-calls e so entao a final
+        return ok(n < 4 ? [assistant('tool-calls', undefined, { time: { completed: 1 } })] : [assistant('stop')])
+      },
+    })
+    const r = await client.esperarAgente({ sessionID: 'ses_x', intervaloMs: 1 })
+    assert.equal(r.info.finish, 'stop', 'esperou passar pelas tool-calls')
+    assert.equal(n, 4, 'nao desistiu no meio do turno')
+  })
+
+  test('tool-calls com time.completed preenchido ainda nao e o fim', async () => {
+    // Foi exatamente o dado observado na sessao real que morreu: `completed`
+    // preenchido e `finish: "tool-calls"`.
+    let n = 0
+    const client = new OpencodeClient({
+      fetchImpl: async () => {
+        n++
+        return ok(n < 2 ? [assistant('tool-calls', undefined, { time: { completed: 1792378118456 } })] : [assistant('stop')])
+      },
+    })
+    const r = await client.esperarAgente({ sessionID: 'ses_x', intervaloMs: 1 })
+    assert.equal(r.info.finish, 'stop')
+    assert.equal(n, 2)
+  })
+
+  test('finish terminal que nao seja stop tambem encerra', async () => {
+    for (const f of ['length', 'content-filter', 'abort', 'other']) {
+      let n = 0
+      const client = new OpencodeClient({
+        fetchImpl: async () => ok((n++, n < 2 ? [assistant('')] : [assistant(f)])),
+      })
+      const r = await client.esperarAgente({ sessionID: 'ses_x', intervaloMs: 1 })
+      assert.equal(r.info.finish, f, `${f} tem que encerrar`)
+    }
+  })
+
+  // A T-006 ficou 30 minutos em "em-andamento" com um `read` que nunca voltou.
+  // Nem "parou de chegar mensagem" serve de sinal — `npm test` some por minutos
+  // de verdade. O que não tem como ser normal é a ferramenta continuar rodando
+  // depois do timeout que ela mesma declarou.
+  describe('ferramenta travada', () => {
+    const agora = Date.now()
+    const rodando = (tool, haMs, timeout) => ({
+      parts: [{ type: 'tool', tool, state: { status: 'running', time: { start: agora - haMs }, input: timeout ? { timeout } : {} } }],
+    })
+
+    test('rodando acima do timeout declarado é travada', () => {
+      const r = OpencodeClient.FERRAMENTA_TRAVADA(rodando('read', 600000, 300000), agora)
+      assert.equal(r.ferramenta, 'read')
+      assert.equal(r.rodandoHaMs, 600000)
+    })
+
+    test('rodando dentro do prazo não é travada', () => {
+      assert.equal(OpencodeClient.FERRAMENTA_TRAVADA(rodando('bash', 60000, 300000), agora), null)
+    })
+
+    test('sem timeout declarado usa o padrão do servidor', () => {
+      assert.equal(OpencodeClient.FERRAMENTA_TRAVADA(rodando('grep', 60000), agora), null, '1min não é travado')
+      assert.ok(OpencodeClient.FERRAMENTA_TRAVADA(rodando('grep', 400000), agora), '6min sem timeout declarado é travado')
+    })
+
+    test('ferramenta concluída nunca é travada, por mais velha que seja', () => {
+      const feita = { parts: [{ type: 'tool', tool: 'read', state: { status: 'completed', time: { start: agora - 600000 }, input: { timeout: 300000 } } }] }
+      assert.equal(OpencodeClient.FERRAMENTA_TRAVADA(feita, agora), null)
+    })
+
+    test('esperarAgente devolve a mensagem marcada quando a ferramenta trava', async () => {
+      const client = new OpencodeClient({
+        fetchImpl: async () =>
+          ok([{ info: { role: 'assistant', finish: 'tool-calls' }, parts: [{ type: 'tool', tool: 'read', state: { status: 'running', time: { start: Date.now() - 600000 }, input: { timeout: 300000 } } }] }]),
+      })
+      const r = await client.esperarAgente({ sessionID: 'ses_x', intervaloMs: 1 })
+      assert.equal(r.info.error.name, 'FerramentaTravada')
+      assert.match(r.info.error.data.message, /parou de progredir/)
+    })
+  })
+
+  // O outro lado da sessão parada: o stream abriu (prompt_async devolveu 204),
+  // existe mensagem de assistant, e ela nunca recebeu uma parte sequer. Sem
+  // isto o orquestrador espera o prazo inteiro olhando para uma mensagem vazia.
+  describe('turno sem produção', () => {
+    const agora = Date.now()
+    const vazia = (haMs, parts = []) => ({ info: { role: 'assistant', time: { created: agora - haMs } }, parts })
+
+    test('assistant vazia há mais de 3min é turno sem produção', () => {
+      const r = OpencodeClient.TURNO_SEM_PRODUCAO(vazia(600000), agora)
+      assert.equal(r.minutos, 10)
+    })
+
+    test('assistant vazia há pouco ainda é o modelo pensando', () => {
+      assert.equal(OpencodeClient.TURNO_SEM_PRODUCAO(vazia(30000), agora), null)
+    })
+
+    test('qualquer parte já é progresso', () => {
+      assert.equal(OpencodeClient.TURNO_SEM_PRODUCAO(vazia(600000, [{ type: 'text', text: 'Vou l' }]), agora), null)
+      assert.equal(
+        OpencodeClient.TURNO_SEM_PRODUCAO(vazia(600000, [{ type: 'tool', tool: 'read', state: { status: 'completed' } }]), agora),
+        null,
+      )
+    })
+
+    test('mensagem de usuário não conta, e finish terminal não conta', () => {
+      assert.equal(OpencodeClient.TURNO_SEM_PRODUCAO({ info: { role: 'user', time: { created: agora - 600000 } }, parts: [] }, agora), null)
+      assert.equal(
+        OpencodeClient.TURNO_SEM_PRODUCAO({ ...vazia(600000), info: { role: 'assistant', finish: 'stop', time: { created: agora - 600000 } } }, agora),
+        null,
+      )
+    })
+
+    test('esperarAgente devolve marcada em vez de esperar o prazo inteiro', async () => {
+      const client = new OpencodeClient({
+        fetchImpl: async () => ok([vazia(600000)]),
+      })
+      const r = await client.esperarAgente({ sessionID: 'ses_x', intervaloMs: 1 })
+      assert.equal(r.info.error.name, 'TurnoSemProducao')
+      assert.match(r.info.error.data.message, /não produziu nada/)
+    })
   })
 
   test('devolve imediatamente quando o agente reporta erro', async () => {

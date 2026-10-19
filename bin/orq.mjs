@@ -404,9 +404,18 @@ for (const tid of alvos) {
       if (crit.nota) log(p(C.dim, `    ${crit.nota}`))
     }
 
-    if (r.avisos?.length) {
+if (r.avisos?.length) {
       log(p(C.bold, '\n  Avisos:'))
-      for (const a of r.avisos) log(`    ${p(C.yellow, '⚠')} ${a}`)
+      for (const a of r.avisos) log(`    ${p(C.yellow, '?')} ${a}`)
+    }
+
+    // Gate que não rodou por causa da máquina. Reprovar aqui seria mentir sobre
+    // a task; aprovar calado seria mentir sobre o gate. Fica no meio, com o
+    // remédio, e a aprovação sai marcada.
+    const ambiente = r.criticosAmbientais || []
+    if (ambiente.length) {
+      log(p(C.bold, '\n  Gates que não rodaram por ambiente:'))
+      for (const a of ambiente) log(`    ${p(C.yellow, '!')} ${a}`)
     }
 
     // Critérios de aceitação são texto; gates são evidência. Reprovar por
@@ -420,7 +429,11 @@ for (const tid of alvos) {
 
     log('')
     if (aprovado) {
-      if (criteriosEmAlerta) {
+      if (ambiente.length) {
+        log(p(C.yellow, `  ⚠ APROVADA com ressalva — ${tid}`))
+        log(p(C.dim, '    Evidência mecânica não cobriu tudo: houve gate que não rodou por ambiente.'))
+        log(p(C.dim, '    Confira a lista acima antes de tratar a task como verificada de ponta a ponta.'))
+      } else if (criteriosEmAlerta) {
         log(p(C.yellow, `  ⚠ APROVADA com ressalva — ${tid}`))
         log(p(C.dim, '    Evidência mecânica (gates) passou. Os critérios acima não têm cobertura textual.'))
         log(p(C.dim, '    Confira na revisão se eles são de fato satisfeitos.'))
