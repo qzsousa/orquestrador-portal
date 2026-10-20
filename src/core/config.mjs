@@ -181,13 +181,14 @@ export const PADRAO = {
      * que o `nemotron-3.5-lightning-free` respondeu uma task e morreu na
      * seguinte. Verificação de saúde é prompt de sondagem, não leitura de config.
      */
-    listaDeModelosGratis: [
-      'opencode/space-bunny-free',
-      'opencode/longcat-2.5-preview-free',
-      'opencode/deepseek-v4.1-flash-free',
-      'opencode/mimo-v2.6-flash-free',
-      'opencode/big-pickle',
-    ],
+     listaDeModelosGratis: [
+       'opencode/space-bunny-free',
+       'opencode/longcat-2.5-preview-free',
+       'opencode/deepseek-v4.1-flash-free',
+       'opencode/mimo-v2.6-flash-free',
+       'opencode/big-pickle',
+       'reflection/Beam-1.0-501B-A23B',
+     ],
   },
   /**
    * MCPs que o `orq sync-mcp` escreve em ~/.config/opencode/opencode.jsonc.
